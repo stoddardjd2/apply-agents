@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "computer-use-openai"
+version = "0.1.0"
+description = "OpenAI Agents API computer-use harness with an Indeed Quick Apply e2e test"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=3.31.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+indeed-quick-apply = "computer_use.indeed_apply:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
