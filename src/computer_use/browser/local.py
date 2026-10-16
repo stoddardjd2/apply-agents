@@ -820,17 +820,12 @@ class LocalCamoufoxComputer(AsyncComputer):
             # a native OS dialog never opens and blocks headed Camoufox.
             await self._try_attach_resume()
             submit_like = await self._click_looks_like_submit(page, x, y)
-            final_submit = await self._click_looks_like_final_submit(page, x, y)
             upload_like = await self._click_looks_like_upload(page, x, y)
             if submit_like:
                 try:
                     self._url_before_submit = page.url
                 except Exception:
                     self._url_before_submit = None
-            # Evidence for Landed: capture the filled form BEFORE Submit (post-submit
-            # pages often redirect to unrelated "similar jobs" listings).
-            if final_submit:
-                await self._capture_pre_submit_screenshot()
 
             async with self._hold_keys(keys):
                 await page.mouse.click(x, y, button=playwright_button)
@@ -916,43 +911,86 @@ class LocalCamoufoxComputer(AsyncComputer):
         except Exception:
             return False
 
-    async def _click_looks_like_final_submit(self, page: Page, x: int, y: int) -> bool:
-        """True for Submit/Apply (not Continue/Next) — used for pre-submit screenshots."""
+    async def _required_fields_incomplete(self, page: Page) -> bool:
+        """True when visible required controls are still empty or invalid."""
         try:
             return bool(
                 await page.evaluate(
-                    """([x, y]) => {
-                      const el = document.elementFromPoint(x, y);
-                      if (!el) return false;
-                      const chain = [];
-                      let n = el;
-                      for (let i = 0; i < 5 && n; i++, n = n.parentElement) chain.push(n);
-                      const blob = chain.map((node) => [
-                        node.innerText || '',
-                        node.value || '',
-                        node.getAttribute?.('aria-label') || '',
-                        node.getAttribute?.('name') || '',
-                        node.id || '',
-                        node.type || '',
-                      ].join(' ')).join(' ').toLowerCase();
-                      if (/\\b(submit application|send application|complete application|apply now|submit)\\b/.test(blob)) {
-                        return true;
+                    """() => {
+                      const skip = new Set([
+                        'hidden', 'submit', 'button', 'image', 'reset', 'file',
+                      ]);
+                      const visible = (el) => {
+                        if (!el || el.disabled) return false;
+                        const st = window.getComputedStyle(el);
+                        if (!st || st.display === 'none' || st.visibility === 'hidden') {
+                          return false;
+                        }
+                        if (Number(st.opacity || '1') === 0) return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                      };
+                      const isRequired = (el) =>
+                        !!(el.required || el.getAttribute('aria-required') === 'true');
+                      const controls = Array.from(
+                        document.querySelectorAll('input, select, textarea')
+                      ).filter((el) => {
+                        const type = (el.type || '').toLowerCase();
+                        if (skip.has(type)) return false;
+                        if (!visible(el)) return false;
+                        return isRequired(el);
+                      });
+                      for (const el of controls) {
+                        const type = (el.type || '').toLowerCase();
+                        if (type === 'radio') {
+                          const name = el.name || '';
+                          const group = name
+                            ? Array.from(document.querySelectorAll(
+                                `input[type="radio"][name="${CSS.escape(name)}"]`
+                              ))
+                            : [el];
+                          if (!group.some((r) => r.checked)) return true;
+                          continue;
+                        }
+                        if (type === 'checkbox') {
+                          if (!el.checked) return true;
+                          continue;
+                        }
+                        if ((el.tagName || '').toLowerCase() === 'select') {
+                          if (!String(el.value || '').trim()) return true;
+                          continue;
+                        }
+                        if (!String(el.value || '').trim()) return true;
+                        if (typeof el.checkValidity === 'function' && !el.checkValidity()) {
+                          return true;
+                        }
                       }
-                      return chain.some((node) => (node.type || '').toLowerCase() === 'submit');
-                    }""",
-                    [x, y],
+                      return false;
+                    }"""
                 )
             )
         except Exception:
             return False
 
-    async def _capture_pre_submit_screenshot(self) -> None:
-        """Upload a full-page JPEG of the filled form once, before Submit is clicked."""
-        if self._pre_submit_screenshot_taken or self._on_full_page_screenshot is None:
-            return
+    async def capture_pre_submit_evidence(self) -> str:
+        """Agent tool entry: full-page JPEG once all required fields are filled.
+
+        Returns a short status string for the model (CAPTURED / INCOMPLETE / …).
+        """
+        if self._pre_submit_screenshot_taken:
+            return "ALREADY_CAPTURED: full-page screenshot already taken this run"
+        try:
+            page = await self._sync_active_page()
+        except Exception as exc:
+            return f"FAILED: browser page unavailable ({exc})"
+        if await self._required_fields_incomplete(page):
+            return (
+                "INCOMPLETE: required fields still empty or invalid — "
+                "finish them, then call capture_pre_submit_screenshot again"
+            )
         captured = await self.capture_full_page_jpeg()
         if not captured:
-            return
+            return "FAILED: could not capture full-page screenshot"
         data, url = captured
         meta: dict[str, Any] = {
             "url": clean_job_url(url) or url,
@@ -963,12 +1001,15 @@ class LocalCamoufoxComputer(AsyncComputer):
             "full_page": True,
             "pre_submit": True,
         }
-        try:
-            self._on_full_page_screenshot(data, meta)
-            self._pre_submit_screenshot_taken = True
-            print("Captured full-page screenshot before Submit.", flush=True)
-        except Exception as exc:
-            print(f"Pre-submit screenshot callback failed: {exc}", flush=True)
+        if self._on_full_page_screenshot is not None:
+            try:
+                self._on_full_page_screenshot(data, meta)
+            except Exception as exc:
+                print(f"Pre-submit screenshot callback failed: {exc}", flush=True)
+                return f"FAILED: upload callback error ({exc})"
+        self._pre_submit_screenshot_taken = True
+        print("Captured full-page screenshot before Submit.", flush=True)
+        return f"CAPTURED: full-page screenshot saved ({len(data)} bytes)"
 
     async def _click_looks_like_upload(self, page: Page, x: int, y: int) -> bool:
         """True when the click target is Upload / Attach / Choose file (opens OS picker)."""
@@ -1710,20 +1751,6 @@ async def run_local_apply(
         verification_since=verification_since,
         on_verification_step=on_verification_step,
     )
-    composed = compose(feature_ctx)
-    if composed.names:
-        print(f"Features: {', '.join(composed.names)}", flush=True)
-
-    prompt = build_prompt(
-        job_url=config.job_url,
-        resume_path=str(config.resume_path),
-        submit_application=config.submit,
-        profile=config.profile,
-        feature_user_blocks=composed.user_blocks,
-    )
-    instructions = build_system_instructions(
-        feature_system=composed.system_instructions
-    )
 
     exit_code = 0
     result: Any = None
@@ -1738,6 +1765,22 @@ async def run_local_apply(
         on_escape_aggregator=on_escape_aggregator,
         on_full_page_screenshot=on_full_page_screenshot,
     ) as computer:
+        # Screenshot tool needs the live computer — compose after browser is up.
+        feature_ctx.browser_computer = computer
+        composed = compose(feature_ctx)
+        if composed.names:
+            print(f"Features: {', '.join(composed.names)}", flush=True)
+
+        prompt = build_prompt(
+            job_url=config.job_url,
+            resume_path=str(config.resume_path),
+            submit_application=config.submit,
+            profile=config.profile,
+            feature_user_blocks=composed.user_blocks,
+        )
+        instructions = build_system_instructions(
+            feature_system=composed.system_instructions
+        )
         agent = Agent(
             name="Job Apply",
             instructions=instructions,
@@ -1776,9 +1819,6 @@ async def run_local_apply(
                         final_report=f"MaxTurnsExceeded after {max_turns} turns"
                     )
             else:
-                # Still try full-page evidence before re-raising / closing browser.
-                if on_full_page_screenshot:
-                    await _emit_full_page_screenshot(computer, on_full_page_screenshot)
                 raise
         else:
             final_output = result.final_output or ""
@@ -1812,11 +1852,6 @@ async def run_local_apply(
                     exit_code = EXIT_NEEDS_HUMAN
             if isinstance(run_hooks, ApplyRunHooks):
                 run_hooks.maybe_record_hard_run(final_report=final_output)
-
-        # Prefer the pre-submit form screenshot. Post-submit pages often redirect to
-        # unrelated listings (Indeed/Glassdoor), which is useless as evidence.
-        if on_full_page_screenshot and not computer._pre_submit_screenshot_taken:
-            await _emit_full_page_screenshot(computer, on_full_page_screenshot)
 
         # Capture filledFields for Applications → Questions & answers (+ urlBefore).
         if page_evidence_out is not None:
@@ -1876,26 +1911,3 @@ async def run_local_apply(
             flush=True,
         )
     return exit_code
-
-
-async def _emit_full_page_screenshot(
-    computer: LocalCamoufoxComputer,
-    callback: FullPageScreenshotCallback,
-) -> None:
-    captured = await computer.capture_full_page_jpeg()
-    if not captured:
-        print("No full-page screenshot to upload.", flush=True)
-        return
-    data, url = captured
-    meta: dict[str, Any] = {
-        "url": clean_job_url(url) or url,
-        "content_type": "image/jpeg",
-        "filename": f"full-page-{int(time.time())}.jpg",
-        "kind": "screenshot",
-        "bytes": len(data),
-        "full_page": True,
-    }
-    try:
-        callback(data, meta)
-    except Exception as exc:
-        print(f"Full-page screenshot callback failed: {exc}", flush=True)

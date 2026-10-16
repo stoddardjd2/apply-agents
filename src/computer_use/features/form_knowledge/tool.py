@@ -20,7 +20,7 @@ def build_tools(ctx: ApplyRunContext) -> list[Any]:
     @function_tool(name_override=TOOL_NAME)
     def resolve_form_question_tool(
         question: str,
-        required: bool = False,
+        required: bool = True,
         options: list[str] | None = None,
         suggested_answer: str | None = None,
         company: str | None = None,
@@ -33,11 +33,11 @@ def build_tools(ctx: ApplyRunContext) -> list[Any]:
         those blank. Prefer answering yourself from PROFILE/KB first — do not
         record routine name/email/phone fields.
 
-        Set required=true only when the control is clearly required. Returns
-        ANSWER: … when known, GENERATE_OK: … for soft essays (mission/values,
-        why interested) or ai_may_answer=true, SKIP_OPTIONAL: … when not
-        required (leave blank), or RECORDED_PENDING: … only for required
-        factual unknowns (user must answer).
+        required defaults to true (this tool is for required unknowns). Pass
+        required=false only for clearly optional fields (returns SKIP_OPTIONAL
+        and does not write the KB). Returns ANSWER: … when known, GENERATE_OK: …
+        for soft essays / ai_may_answer, or RECORDED_PENDING: … for factual
+        unknowns the user must answer.
         """
         return resolve_form_question(
             question=question,

@@ -9,6 +9,7 @@ from .account_signup import AccountSignupFeature
 from .base import ApplyFeature, ApplyRunContext, ComposedFeatures
 from .form_knowledge import FormKnowledgeFeature
 from .learnings import LearningsFeature
+from .pre_submit_screenshot import PreSubmitScreenshotFeature
 from .verification_code import VerificationCodeFeature
 
 DEFAULT_FEATURES: tuple[ApplyFeature, ...] = (
@@ -16,6 +17,7 @@ DEFAULT_FEATURES: tuple[ApplyFeature, ...] = (
     LearningsFeature,
     AccountSignupFeature,
     VerificationCodeFeature,
+    PreSubmitScreenshotFeature,
 )
 
 

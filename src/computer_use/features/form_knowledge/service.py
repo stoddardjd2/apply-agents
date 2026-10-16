@@ -55,6 +55,23 @@ _AI_FACTUAL_BLOCK_RE = re.compile(
     re.I,
 )
 
+# Short keys that appear inside unrelated wording (e.g. "state" in "state healthcare").
+# These must match as field phrasing, never as bare substrings.
+_AMBIGUOUS_PROFILE_KEYS = frozenset(
+    {
+        "state",
+        "city",
+        "country",
+        "remote",
+        "notice",
+        "address",
+        "summary",
+        "headline",
+        "open to",
+        "skills",
+    }
+)
+
 # question-substring → profile key (checked after custom_answers / exact key match)
 _PROFILE_HINTS: list[tuple[tuple[str, ...], str]] = [
     (("email", "e-mail"), "email"),
@@ -62,23 +79,53 @@ _PROFILE_HINTS: list[tuple[tuple[str, ...], str]] = [
     (("first name", "given name"), "first_name"),
     (("last name", "surname", "family name"), "last_name"),
     (("full name", "legal name"), "full_name"),
-    (("city",), "city"),
-    (("state", "province"), "state"),
+    (
+        (
+            "your city",
+            "what city",
+            "which city",
+            "city of residence",
+            "current city",
+            "home city",
+        ),
+        "city",
+    ),
+    (
+        (
+            "your state",
+            "what state",
+            "which state",
+            "state of residence",
+            "state province",
+            "state/province",
+            "home state",
+        ),
+        "state",
+    ),
     (("zip", "postal code", "postcode"), "postal_code"),
-    (("country",), "country"),
+    (
+        (
+            "your country",
+            "what country",
+            "which country",
+            "country of residence",
+            "home country",
+        ),
+        "country",
+    ),
     (("linkedin",), "linkedin_url"),
     (("github",), "github_url"),
     (("website", "portfolio", "personal site"), "website_url"),
     (("years of experience", "years experience", "how many years"), "years_experience"),
     (("current title", "job title", "most recent title"), "current_title"),
-    (("current company", "employer", "most recent company"), "current_company"),
+    (("current company", "most recent company"), "current_company"),
     (("work authorization", "authorized to work", "legally authorized"), "work_authorization"),
     (("sponsorship", "visa sponsorship", "require sponsorship"), "require_sponsorship"),
     (("citizen", "permanent resident", "u.s. citizen"), "citizen_or_permanent_resident"),
     (("relocate", "willing to relocate"), "willing_to_relocate"),
-    (("remote", "work from home"), "remote_preference"),
+    (("work from home", "remote preference", "remote or hybrid"), "remote_preference"),
     (("start date", "earliest start", "available to start"), "earliest_start_date"),
-    (("notice period", "notice"), "notice_period"),
+    (("notice period",), "notice_period"),
     (("salary", "compensation", "pay expectation", "expected pay"), "salary_expectation_usd"),
     (("how did you hear", "how you heard", "referral source"), "how_heard"),
     (("cover letter",), "cover_letter"),
@@ -272,7 +319,47 @@ def _profile_get(profile: dict[str, Any], dotted: str) -> Any:
     return cur
 
 
-def answer_from_profile(question: str, profile: dict[str, Any] | None) -> str | None:
+def _phrase_in_question(needle: str, key: str) -> bool:
+    """True when needle appears as a whole phrase in the normalized question."""
+    n = (needle or "").strip()
+    if not n or not key:
+        return False
+    return bool(re.search(rf"(?:^|\s){re.escape(n)}(?:\s|$)", key))
+
+
+def _profile_key_matches_question(pk_norm: str, key: str) -> bool:
+    """Match profile field names to questions without false hits like state⊂state healthcare."""
+    if not pk_norm or not key:
+        return False
+    if pk_norm == key:
+        return True
+    ambiguous = pk_norm in _AMBIGUOUS_PROFILE_KEYS or len(pk_norm) <= 5
+    if ambiguous:
+        # Field-oriented phrasing only — bare "state"/"city"/"country" is too common.
+        patterns = (
+            rf"(?:^|\s)(?:your|applicant.?s?|current|home|mailing)\s+{re.escape(pk_norm)}(?:\s|$)",
+            rf"(?:^|\s)(?:what|which)\s+(?:is\s+)?(?:your\s+)?{re.escape(pk_norm)}(?:\s|$)",
+            rf"(?:^|\s){re.escape(pk_norm)}\s+(?:of residence|province|region)(?:\s|$)",
+            rf"(?:^|\s){re.escape(pk_norm)}\s*\??$",
+        )
+        return any(re.search(p, key) for p in patterns)
+    return _phrase_in_question(pk_norm, key)
+
+
+def _answer_fits_options(answer: str, options: list[str] | None) -> bool:
+    """When the form exposes choices, profile hits must match one (case-insensitive)."""
+    opts = [str(o).strip() for o in (options or []) if str(o).strip()]
+    if not opts:
+        return True
+    a = answer.strip().lower()
+    return any(a == o.lower() for o in opts)
+
+
+def answer_from_profile(
+    question: str,
+    profile: dict[str, Any] | None,
+    options: list[str] | None = None,
+) -> str | None:
     """Best-effort answer from profile / custom_answers without writing to the KB."""
     if not profile:
         return None
@@ -280,27 +367,45 @@ def answer_from_profile(question: str, profile: dict[str, Any] | None) -> str | 
     if not key:
         return None
 
+    def _accept(raw: Any, *, profile_key: str | None = None) -> str | None:
+        if not _answer_nonempty(raw):
+            return None
+        formatted = _format_answer(raw, profile_key=profile_key)
+        if not _answer_fits_options(formatted, options):
+            return None
+        return formatted
+
     custom = profile.get("custom_answers")
     if isinstance(custom, dict):
         for ck, cv in custom.items():
             ck_norm = normalize_question(str(ck).replace("_", " "))
-            if ck_norm and (ck_norm == key or ck_norm in key or key in ck_norm):
-                if _answer_nonempty(cv):
-                    return _format_answer(cv)
+            if not ck_norm:
+                continue
+            # Prefer exact / contained custom keys; avoid tiny accidental overlaps.
+            if ck_norm == key or (
+                len(ck_norm) >= 8 and (ck_norm in key or key in ck_norm)
+            ):
+                hit = _accept(cv)
+                if hit is not None:
+                    return hit
 
     # Exact / near-exact top-level keys mentioned in the question
     for pk, pv in profile.items():
         if pk == "custom_answers" or str(pk).startswith("_") or isinstance(pv, (dict, list)):
             continue
         pk_norm = normalize_question(str(pk).replace("_", " "))
-        if pk_norm and pk_norm in key and _answer_nonempty(pv):
-            return _format_answer(pv, profile_key=str(pk))
+        if pk_norm and _profile_key_matches_question(pk_norm, key):
+            hit = _accept(pv, profile_key=str(pk))
+            if hit is not None:
+                return hit
 
     for needles, dotted in _PROFILE_HINTS:
-        if any(n in key for n in needles):
+        if any(_phrase_in_question(n, key) or n in key for n in needles):
+            # Ambiguous short needles already use long field phrases in _PROFILE_HINTS.
             val = _profile_get(profile, dotted)
-            if _answer_nonempty(val):
-                return _format_answer(val, profile_key=dotted)
+            hit = _accept(val, profile_key=dotted)
+            if hit is not None:
+                return hit
     return None
 
 
@@ -457,7 +562,7 @@ def resolve_form_question(
     if hit is not None:
         return f"ANSWER: {_format_answer(hit.get('answer'))}"
 
-    from_profile = answer_from_profile(question, profile)
+    from_profile = answer_from_profile(question, profile, options=options)
     if from_profile is not None:
         return (
             f"ANSWER: {from_profile} "

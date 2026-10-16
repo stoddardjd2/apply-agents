@@ -121,6 +121,51 @@ def test_answer_from_profile_sponsorship_hint() -> None:
     ) == "No"
 
 
+def test_state_not_matched_inside_state_healthcare(tmp_path: Path) -> None:
+    """Regression: 'state' in 'state healthcare program' must not yield profile.state."""
+    path = tmp_path / "kb.json"
+    profile = {
+        "state": "Washington",
+        "city": "North Bend",
+        "country": "United States",
+    }
+    q = (
+        "Have you ever been excluded, debarred, suspended, or otherwise found "
+        "ineligible from a federal or state healthcare program or government "
+        "procurement program?"
+    )
+    assert answer_from_profile(q, profile) is None
+    assert answer_from_profile(q, profile, options=["Yes", "No"]) is None
+    msg = resolve_form_question(
+        question=q,
+        required=True,
+        options=["Yes", "No"],
+        company="CVS Health",
+        profile=profile,
+        path=path,
+    )
+    assert msg.startswith("RECORDED_PENDING:")
+    assert pending_count(path) == 1
+
+
+def test_profile_state_still_matches_field_phrasing() -> None:
+    profile = {"state": "Washington", "city": "North Bend"}
+    assert answer_from_profile("What is your state of residence?", profile) == "Washington"
+    assert answer_from_profile("City?", profile) == "North Bend"
+
+
+def test_profile_answer_rejected_when_not_in_options() -> None:
+    profile = {"state": "Washington"}
+    assert (
+        answer_from_profile(
+            "What is your state?",
+            profile,
+            options=["Yes", "No"],
+        )
+        is None
+    )
+
+
 def test_optional_unknown_skips_without_pending(tmp_path: Path) -> None:
     path = tmp_path / "kb.json"
     msg = resolve_form_question(

@@ -31,6 +31,8 @@ class ApplyRunContext:
     # Set by the harness when Landed verification polling is wired.
     verification_since: str | None = None
     on_verification_step: VerificationStepCallback | None = None
+    # Set by the harness once Camoufox is up (pre_submit_screenshot tool).
+    browser_computer: Any | None = None
 
 
 @dataclass(frozen=True)
