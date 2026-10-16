@@ -1,0 +1,26 @@
+graph TB
+  Operator["Operator"]
+  subgraph CU["apply-agents"]
+    ApplyCLI["Apply CLI"]
+    WorkerCLI["Worker CLI"]
+    Harness["Browser Harness"]
+    Files["Local File Store"]
+  end
+  OpenAI["OpenAI API"]
+  Landed["Landed API"]
+  ATS["Job Boards / ATS"]
+  NopeCHA["NopeCHA"]
+  NoneCap["NoneCap"]
+
+  Operator -->|manual apply / --login| ApplyCLI
+  Operator -->|claim loop| WorkerCLI
+  Operator -->|edits configs / form KB| Files
+  ApplyCLI -->|run_local_apply| Harness
+  WorkerCLI -->|run_local_apply + callbacks| Harness
+  WorkerCLI -->|claim + finish| Landed
+  Harness --> Files
+  Harness --> OpenAI
+  Harness --> ATS
+  Harness --> NopeCHA
+  Harness --> NoneCap
+  Harness -->|steps, artifacts, OTP| Landed

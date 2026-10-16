@@ -1,0 +1,53 @@
+{
+  "job_url": "https://your-board.com/jobs/123",
+  "resume_path": "resumes/resume.pdf",
+  "submit": false,
+  "account_signup": {
+    "enabled": true,
+    "create_on_non_major_employers": true,
+    "email": "",
+    "prefer_google_sso": true,
+    "never_signup_on": [
+      "glassdoor.com",
+      "indeed.com",
+      "linkedin.com",
+      "ziprecruiter.com",
+      "monster.com",
+      "simplyhired.com"
+    ],
+    "major_employers": [
+      "Google",
+      "Meta",
+      "Amazon",
+      "Apple",
+      "Microsoft"
+    ]
+  },
+  "profile": {
+    "first_name": "",
+    "last_name": "",
+    "full_name": "",
+    "email": "",
+    "phone": "",
+    "phone_country_code": "+1",
+    "city": "",
+    "state": "",
+    "postal_code": "",
+    "address": "",
+    "country": "United States",
+    "linkedin_url": "",
+    "github_url": "",
+    "website_url": "",
+    "years_experience": null,
+    "work_authorization": "Authorized to work in the United States",
+    "require_sponsorship": false,
+    "salary_expectation_usd": null,
+    "salary_currency": "USD",
+    "eeo": {
+      "gender": "prefer_not_to_say",
+      "race_ethnicity": "prefer_not_to_say",
+      "veteran_status": "prefer_not_to_say",
+      "disability_status": "prefer_not_to_say"
+    }
+  }
+}

@@ -1,71 +1,94 @@
-# computer-use-openai
+# apply-agents
 
-OpenAI Agents API [computer use](https://developers.openai.com/api/docs/guides/agents-api/tools/computer-use) project with a hosted-browser end-to-end test for Indeed Easy Apply / Quick Apply.
+Apply to a **specific job URL** with your **resume PDF**, using local headed [Camoufox](https://camoufox.com/) + OpenAI Agents computer use.
 
-The browser runs in OpenAI's hosted environment. This repo:
+MIT licensed — see [LICENSE](LICENSE).
 
-1. Creates an Agents API session with `{ "type": "computer_use" }`
-2. Auto-approves configured Indeed origins
-3. Supplies Indeed sign-in credentials from env (or prompts interactively)
-4. Runs a Quick Apply flow and reports the result
+## Configure
+
+Copy the example configs (do not commit your filled copies — they are gitignored):
+
+```powershell
+copy apply.config.example.json apply.config.json
+copy worker.config.example.json worker.config.json
+```
+
+Edit `apply.config.json`:
+
+```json
+{
+  "job_url": "https://your-board.com/jobs/123",
+  "resume_path": "resumes/resume.pdf",
+  "submit": false,
+  "profile": { "first_name": "Your", "email": "", "...": "..." }
+}
+```
+
+Put your PDF at `resume_path`. Fill `profile.email` / `profile.phone` (or set `APPLICANT_EMAIL` / `APPLICANT_PHONE` in `.env`). The agent uses `profile` for common application fields (name, links, work auth, EEO preferences, custom answers, etc.).
+
+**Salary / compensation:** leave `profile.salary_expectation_usd` as `null` to auto-pick an annual USD figure from the job’s posted salary range (Landed claim/DB) biased by `years_experience`. Set it to a number (e.g. `120000`) to **override** that auto value for every apply.
+
+Unknown screening questions are recorded in `form_knowledge.json` (override with `FORM_KNOWLEDGE_PATH`). The agent answers from `profile` and prior KB answers first; only gaps become pending. Set each pending entry’s `answer` field to reuse it on later applies, or set `"ai_may_answer": true` to let the agent write a short answer for that question.
+
+`account_signup` lets the agent create an employer-site account on **non-major** companies (email in config; set `APPLY_ACCOUNT_PASSWORD` in `.env`). Major employers are skipped; Google SSO is preferred when available.
 
 ## Setup
 
 ```powershell
-cd C:\Users\jared\programming\computer-vision-openai
-python -m venv .venv
+cd path\to\apply-agents
 .\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
-copy .env.example .env
+pip install -e ".[local]"
 ```
 
-Fill `.env`:
+This project uses its own Camoufox install under `.cache/camoufox-install` (see `CAMOUFOX_INSTALL_DIR` in `.env`) so it can run at the same time as another Camoufox on this PC that uses `%LOCALAPPDATA%\camoufox`. The first apply/login run downloads the browser into that folder (~300MB). Profiles stay separate via `BROWSER_PROFILE=.camoufox-profile`.
 
-- `OPENAI_API_KEY`
-- `INDEED_EMAIL` / `INDEED_PASSWORD`
-- Optional: `INDEED_QUERY`, `INDEED_LOCATION`, `INDEED_JOB_URL`
-
-## Run Indeed Quick Apply
-
-Dry run (fills the form, stops before final submit — default):
+One-time browser login (Cloudflare / Google):
 
 ```powershell
-python -m computer_use.indeed_apply
+python -m computer_use.apply --login
 ```
 
-Full submit:
+Captcha solvers (agent never clicks puzzles) — full list, env vars, and links:
+
+→ **[src/computer_use/captcha/README.md](src/computer_use/captcha/README.md)**
+
+Quick setup:
 
 ```powershell
-$env:SUBMIT_APPLICATION="1"
-python -m computer_use.indeed_apply --submit
+# NoneCap key for hCaptcha → https://dashboard.nonecap.com  (NONECAP_KEY in .env)
+# NopeCHA addon for Turnstile / reCAPTCHA / etc.:
+python -m computer_use.apply --ensure-nopecha
 ```
 
-Or target a specific listing:
+## Run (manual / testing)
+
+Still works for a single URL + resume from `apply.config.json`:
 
 ```powershell
-python -m computer_use.indeed_apply --job-url "https://www.indeed.com/viewjob?jk=..."
+python -m computer_use.apply
+python -m computer_use.apply --job-url https://... --resume resumes\me.pdf
+python -m computer_use.apply --submit
 ```
 
-Artifacts land in `artifacts/` (`last-screenshot.jpg`, `result.txt`).
+Or set `"submit": true` in `apply.config.json` / `SUBMIT_APPLICATION=1` in `.env`.
 
-## Tests
+When the site opens a file picker, the harness auto-attaches your PDF.
 
-Unit tests (no API key):
+## Landed worker queue
+
+Claims ready applications from Landed’s API, uses `apply.config.json` for profile/signup, and Landed’s tailored resume + cover letter per job.
+
+API URL defaults to `http://localhost:8180`. Worker token is read from `../landed/.env` (`LANDED_WORKER_TOKEN`) — no need to duplicate it here.
+
+1. Edit `worker.config.json` — one `blocklist` (e.g. `linkedin`, `workday`) blocks both adapter and URL host
+2. Stop Landed’s Node browser-worker so only this process claims jobs
+3. Run:
 
 ```powershell
-pytest -q
+python -m computer_use.worker
+python -m computer_use.worker --once
 ```
 
-Live e2e (uses OpenAI + Indeed):
+## Costs
 
-```powershell
-$env:RUN_INDEED_E2E="1"
-$env:SUBMIT_APPLICATION="0"
-pytest -q tests/test_indeed_quick_apply.py -k e2e
-```
-
-## Notes
-
-- Origin access must be approved per [the computer-use guide](https://developers.openai.com/api/docs/guides/agents-api/tools/computer-use). `AUTO_APPROVE_ORIGINS` covers common Indeed hosts.
-- Sign-in values are sent only through `computer_use_approval_request_result` events, never in chat.
-- Keep `SUBMIT_APPLICATION=0` until you are ready to send a real application.
+Estimates append to `costs.json`.

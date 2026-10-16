@@ -1,0 +1,41 @@
+graph TB
+  subgraph Harness["Browser Harness"]
+    Config["Apply / Worker Config"]
+    Registry["Feature Registry"]
+    FormKB["Form Knowledge"]
+    Learnings["Learnings"]
+    Signup["Account Signup"]
+    OTP["Verification Code"]
+    Prompts["Apply Prompts"]
+    Agent["Agent Runner"]
+    Camoufox["LocalCamoufoxComputer"]
+    Captcha["Captcha Solvers"]
+    LandedClient["Landed Client"]
+    Escape["Aggregator Escape"]
+    Costs["Cost Tracker"]
+    FillLog["Fill / Agent Log"]
+  end
+
+  Registry --> FormKB
+  Registry --> Learnings
+  Registry --> Signup
+  Registry --> OTP
+  Registry --> Prompts
+  Agent --> Prompts
+  Agent --> Registry
+  Agent --> Camoufox
+  Agent -->|turns| OpenAI["OpenAI API"]
+  Camoufox --> Captcha
+  Camoufox --> Escape
+  Camoufox -->|browse/fill| ATS["Job Boards / ATS"]
+  Captcha --> NopeCHA["NopeCHA"]
+  Captcha --> NoneCap["NoneCap"]
+  OTP --> LandedClient
+  Escape --> LandedClient
+  FillLog --> LandedClient
+  LandedClient -->|HTTP| Landed["Landed API"]
+  Config --> Files["Local File Store"]
+  FormKB --> Files
+  Learnings --> Files
+  Costs --> Files
+  Camoufox --> Files

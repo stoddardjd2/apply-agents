@@ -1,0 +1,29 @@
+graph LR
+  linkStyle default fill:#ffffff
+
+  subgraph diagram ["System Context View: apply-agents"]
+    style diagram fill:#ffffff,stroke:#ffffff
+
+    1["<div style='font-weight: bold'>Operator</div><div style='font-size: 70%; margin-top: 0px'>[Person]</div><div style='font-size: 80%; margin-top:10px'>Configures profile/resume and<br />runs apply or worker CLIs.</div>"]
+    style 1 fill:#08427b,stroke:#052e56,color:#ffffff
+    2["<div style='font-weight: bold'>OpenAI API</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>Agents SDK computer-use<br />model: screenshots in, UI<br />actions out.</div>"]
+    style 2 fill:#999999,stroke:#6b6b6b,color:#ffffff
+    3["<div style='font-weight: bold'>Landed API</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>Sibling app: job claim queue,<br />resume download,<br />steps/artifacts, finish,<br />Gmail OTP.</div>"]
+    style 3 fill:#999999,stroke:#6b6b6b,color:#ffffff
+    4["<div style='font-weight: bold'>Job Boards / ATS</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>Indeed, Glassdoor,<br />Greenhouse, Lever, Ashby,<br />Workday, JazzHR, and employer<br />career sites.</div>"]
+    style 4 fill:#999999,stroke:#6b6b6b,color:#ffffff
+    5["<div style='font-weight: bold'>NopeCHA</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>Firefox addon + API for<br />Turnstile, reCAPTCHA,<br />Cloudflare challenges.</div>"]
+    style 5 fill:#999999,stroke:#6b6b6b,color:#ffffff
+    6["<div style='font-weight: bold'>NoneCap</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>hCaptcha token API used to<br />inject solved tokens into<br />pages.</div>"]
+    style 6 fill:#999999,stroke:#6b6b6b,color:#ffffff
+    7["<div style='font-weight: bold'>apply-agents</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>Applies to job URLs with a<br />resume PDF using headed<br />Camoufox driven by OpenAI<br />computer use.</div>"]
+    style 7 fill:#1168bd,stroke:#0b4884,color:#ffffff
+
+    1-. "<div>Runs apply / worker</div><div style='font-size: 70%'></div>" .->7
+    7-. "<div>Computer-use agent turns</div><div style='font-size: 70%'></div>" .->2
+    7-. "<div>Claim jobs, report steps,<br />poll OTP</div><div style='font-size: 70%'></div>" .->3
+    7-. "<div>Browse and submit<br />applications</div><div style='font-size: 70%'></div>" .->4
+    7-. "<div>Solve Turnstile / reCAPTCHA</div><div style='font-size: 70%'></div>" .->5
+    7-. "<div>Solve hCaptcha</div><div style='font-size: 70%'></div>" .->6
+
+  end

@@ -1,3 +1,3 @@
-from .indeed_apply import main
+from .apply import main
 
 raise SystemExit(main())

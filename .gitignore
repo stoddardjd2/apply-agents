@@ -10,8 +10,24 @@ __pycache__/
 dist/
 build/
 artifacts/
+costs.json
+.browser-profile/
+.camoufox-profile/
+.camoufox-profile-*/
+.cache/
+browser-auth.json
+resumes/*.pdf
+!resumes/.gitkeep
 *.jpg
 *.jpeg
 *.png
 .DS_Store
 Thumbs.db
+
+# Local secrets / personal data (never commit)
+apply.config.json
+worker.config.json
+form_knowledge.json
+form_knowledge.json.*.tmp
+apply_learnings.json
+*.tmp
