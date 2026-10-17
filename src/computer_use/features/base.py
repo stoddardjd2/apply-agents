@@ -33,6 +33,8 @@ class ApplyRunContext:
     on_verification_step: VerificationStepCallback | None = None
     # Set by the harness once Camoufox is up (pre_submit_screenshot tool).
     browser_computer: Any | None = None
+    # Profile keys to fill even when the form marks them optional.
+    always_fill_fields: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

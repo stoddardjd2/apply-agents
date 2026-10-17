@@ -19,41 +19,112 @@ from typing import Any
 NONECAP_API_BASE = "https://api.nonecap.com/v1"
 
 # Extract sitekey / rqdata from a rendered hCaptcha widget (host or iframe).
-EXTRACT_HCAPTCHA_JS = """() => {
+# Challenge iframes put sitekey in the URL *hash* (#sitekey=…), not ?search —
+# searchParams alone misses those and NoneCap never gets called.
+EXTRACT_HCAPTCHA_JS = r"""() => {
   const out = {
     sitekey: null,
     rqdata: null,
     callback: null,
     enterprise: false,
     userAgent: navigator.userAgent || '',
+    source: null,
   };
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const hosts = [
-    ...document.querySelectorAll('[data-sitekey], .h-captcha, [class*="hcaptcha" i]'),
-  ];
-  for (const el of hosts) {
-    const sk = el.getAttribute('data-sitekey') || '';
-    if (uuid.test(sk)) {
+  const take = (sk, rq, cb, source) => {
+    if (!sk || !uuid.test(sk)) return false;
+    if (!out.sitekey) {
       out.sitekey = sk;
-      out.rqdata = el.getAttribute('data-rqdata') || null;
-      out.callback = el.getAttribute('data-callback') || null;
-      if (out.rqdata) out.enterprise = true;
-      break;
+      out.source = source || null;
     }
-  }
-  for (const f of document.querySelectorAll('iframe[src*="hcaptcha"]')) {
+    if (rq) {
+      out.rqdata = rq;
+      out.enterprise = true;
+    }
+    if (cb && !out.callback) out.callback = cb;
+    return true;
+  };
+  const paramsFromUrl = (raw) => {
+    const found = { sitekey: null, rqdata: null };
     try {
-      const u = new URL(f.src);
-      const sk = u.searchParams.get('sitekey');
-      if (sk && uuid.test(sk)) out.sitekey = out.sitekey || sk;
-      const rq = u.searchParams.get('rqdata');
-      if (rq) {
-        out.rqdata = rq;
-        out.enterprise = true;
+      const u = new URL(raw, location.href);
+      found.sitekey = u.searchParams.get('sitekey');
+      found.rqdata = u.searchParams.get('rqdata');
+      const hash = (u.hash || '').replace(/^#/, '');
+      if (hash) {
+        const hp = new URLSearchParams(hash);
+        found.sitekey = found.sitekey || hp.get('sitekey');
+        found.rqdata = found.rqdata || hp.get('rqdata');
       }
     } catch (_) {}
+    return found;
+  };
+
+  const hosts = [
+    ...document.querySelectorAll(
+      '[data-sitekey], .h-captcha, [class*="h-captcha" i], [class*="hcaptcha" i]'
+    ),
+  ];
+  for (const el of hosts) {
+    take(
+      el.getAttribute('data-sitekey') || '',
+      el.getAttribute('data-rqdata') || null,
+      el.getAttribute('data-callback') || null,
+      'data-sitekey'
+    );
   }
+
+  for (const f of document.querySelectorAll('iframe')) {
+    const src = f.getAttribute('src') || f.src || '';
+    if (!/hcaptcha/i.test(src)) continue;
+    const p = paramsFromUrl(src);
+    take(p.sitekey, p.rqdata, null, 'iframe');
+  }
+
+  // Invisible / explicit render: sitekey often only appears in inline scripts.
+  try {
+    const html = document.documentElement && document.documentElement.outerHTML || '';
+    const patterns = [
+      /data-sitekey=["']([0-9a-f-]{36})["']/i,
+      /sitekey["']?\s*[:=]\s*["']([0-9a-f-]{36})["']/i,
+      /[?&#]sitekey=([0-9a-f-]{36})/i,
+    ];
+    for (const re of patterns) {
+      const m = html.match(re);
+      if (m) take(m[1], null, null, 'html');
+    }
+  } catch (_) {}
+
+  // Resource URLs (challenge assets) sometimes carry sitekey in the fragment.
+  try {
+    for (const e of performance.getEntriesByType('resource') || []) {
+      const name = String(e.name || '');
+      if (!/hcaptcha/i.test(name)) continue;
+      const p = paramsFromUrl(name);
+      take(p.sitekey, p.rqdata, null, 'resource');
+    }
+  } catch (_) {}
+
   return out;
+}"""
+
+# Debug helper when extraction fails — iframe srcs / sitekey-looking strings.
+DIAGNOSE_HCAPTCHA_JS = """() => {
+  const iframes = [...document.querySelectorAll('iframe')].slice(0, 12).map((f) => ({
+    src: (f.getAttribute('src') || f.src || '').slice(0, 240),
+    w: Math.round(f.offsetWidth || 0),
+    h: Math.round(f.offsetHeight || 0),
+  }));
+  const hosts = [...document.querySelectorAll('[data-sitekey]')].slice(0, 8).map((el) => ({
+    sitekey: el.getAttribute('data-sitekey'),
+    className: String(el.className || '').slice(0, 80),
+  }));
+  return {
+    href: String(location.href || '').slice(0, 200),
+    hasHcaptchaApi: typeof window.hcaptcha !== 'undefined',
+    iframes,
+    hosts,
+  };
 }"""
 
 _INJECT_TOKEN_TEMPLATE = r"""

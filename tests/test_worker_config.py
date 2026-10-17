@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from computer_use.config import WorkerConfig, load_apply_config_for_job, load_worker_config
 
 
@@ -55,7 +57,10 @@ def test_claim_adapters_from_allowlist() -> None:
     assert empty.claim_adapters() == []
 
 
-def test_load_worker_config_defaults(tmp_path: Path) -> None:
+def test_load_worker_config_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("WORKER_BLOCKLIST", raising=False)
     path = tmp_path / "worker.config.json"
     path.write_text(
         json.dumps({"landed_api_base": "http://127.0.0.1:9", "blocklist": ["workday"]}),
@@ -64,6 +69,53 @@ def test_load_worker_config_defaults(tmp_path: Path) -> None:
     cfg = load_worker_config(path)
     assert cfg.landed_api_base == "http://127.0.0.1:9"
     assert cfg.blocklist == ["workday"]
+
+
+def test_load_worker_config_empty_blocklist_means_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[] must not invent a default blocklist."""
+    monkeypatch.delenv("WORKER_BLOCKLIST", raising=False)
+    path = tmp_path / "worker.config.json"
+    path.write_text(
+        json.dumps({"landed_api_base": "http://127.0.0.1:9", "blocklist": []}),
+        encoding="utf-8",
+    )
+    cfg = load_worker_config(path)
+    assert cfg.blocklist == []
+    assert (
+        cfg.is_blocked(
+            adapter="workday",
+            apply_url="https://tmobile.wd1.myworkdayjobs.com/External/job/x",
+        )
+        is None
+    )
+
+
+def test_load_worker_config_omitted_blocklist_blocks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("WORKER_BLOCKLIST", raising=False)
+    path = tmp_path / "worker.config.json"
+    path.write_text(
+        json.dumps({"landed_api_base": "http://127.0.0.1:9"}),
+        encoding="utf-8",
+    )
+    cfg = load_worker_config(path)
+    assert cfg.blocklist == []
+
+
+def test_load_worker_config_blocklist_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WORKER_BLOCKLIST", "linkedin, workday")
+    path = tmp_path / "worker.config.json"
+    path.write_text(
+        json.dumps({"landed_api_base": "http://127.0.0.1:9", "blocklist": []}),
+        encoding="utf-8",
+    )
+    cfg = load_worker_config(path)
+    assert cfg.blocklist == ["linkedin", "workday"]
 
 
 def test_load_apply_config_for_job_overrides_cover(tmp_path: Path) -> None:

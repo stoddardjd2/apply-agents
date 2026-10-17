@@ -2,6 +2,9 @@
   "job_url": "https://your-board.com/jobs/123",
   "resume_path": "resumes/resume.pdf",
   "submit": false,
+  "always_fill_fields": [
+    "website_url"
+  ],
   "account_signup": {
     "enabled": true,
     "create_on_non_major_employers": true,
@@ -48,6 +51,8 @@
       "race_ethnicity": "prefer_not_to_say",
       "veteran_status": "prefer_not_to_say",
       "disability_status": "prefer_not_to_say"
-    }
+    },
+    "relatives": [],
+    "_relatives_help": "List relatives/friends at employers when relevant, e.g. [{\"name\":\"…\",\"relationship\":\"sibling\",\"company\":\"Acme\",\"title\":\"…\"}]. Empty list (or omit) means no relatives — answer No / None / N/A on those questions."
   }
 }

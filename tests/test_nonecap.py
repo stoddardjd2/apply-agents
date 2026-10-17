@@ -16,11 +16,19 @@ from computer_use.captcha.nonecap import (
 
 def test_extract_and_inject_scripts_are_nonempty() -> None:
     assert "data-sitekey" in EXTRACT_HCAPTCHA_JS
+    # Challenge iframes put sitekey in the hash fragment, not query string.
+    assert "URLSearchParams(hash)" in EXTRACT_HCAPTCHA_JS or "hash" in EXTRACT_HCAPTCHA_JS
     script = build_inject_token_script("P1_test", "E0_key")
     assert "h-captcha-response" in script
     assert "P1_test" in script
     assert "E0_key" in script
     assert "ensureField" in script
+
+
+def test_extract_js_parses_hash_sitekey() -> None:
+    """Smoke: extractor source must read #sitekey= from iframe URLs."""
+    assert "sitekey" in EXTRACT_HCAPTCHA_JS
+    assert "paramsFromUrl" in EXTRACT_HCAPTCHA_JS
 
 def test_nonecap_enabled_requires_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("NONECAP_KEY", raising=False)

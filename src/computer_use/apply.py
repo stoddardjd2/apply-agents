@@ -124,16 +124,21 @@ def main(argv: list[str] | None = None) -> int:
 
         config = replace(config, submit=True)
 
-    from .browser import run_local_apply
+    from .browser.local import hold_orphaned_browsers_until_interrupt, run_local_apply
 
-    return asyncio.run(
-        run_local_apply(
+    async def _run() -> int:
+        code = await run_local_apply(
             model=model,
             config=config,
             costs_path=args.costs,
             profile_dir=args.profile,
         )
-    )
+        # needs_human + KEEP_BROWSER_ON_NEEDS_HUMAN leaves Camoufox open; stay
+        # alive so process exit does not tear the window down.
+        await hold_orphaned_browsers_until_interrupt()
+        return code
+
+    return asyncio.run(_run())
 
 
 if __name__ == "__main__":

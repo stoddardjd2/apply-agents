@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from agents import (
     Agent,
@@ -31,6 +36,7 @@ from ..captcha.nopecha import (
     prepare_nopecha_addon,
 )
 from ..captcha.nonecap import (
+    DIAGNOSE_HCAPTCHA_JS,
     EXTRACT_HCAPTCHA_JS,
     build_inject_token_script,
     nonecap_enabled,
@@ -104,6 +110,19 @@ CUA_KEY_TO_PLAYWRIGHT_KEY = {
 
 DEFAULT_PROFILE_DIR = Path(".camoufox-profile")
 DEFAULT_STORAGE_STATE = Path("browser-auth.json")
+# Ephemeral profiles used when a needs_human review window still holds the main profile.
+WORK_PROFILE_ROOT = Path(".cache") / "camoufox-work"
+
+# Camoufox sessions left open after needs_human (KEEP_BROWSER_ON_NEEDS_HUMAN).
+# Strong refs keep Playwright from GC-closing the window while the worker lives.
+@dataclass
+class _OrphanSession:
+    fox: Any
+    profile_dir: Path
+    ephemeral: bool
+
+
+_orphaned_camoufox: list[_OrphanSession] = []
 
 # Apply / auth flows often open in a new tab. Prefer these over search/listing pages.
 _APPLY_URL_HINTS = (
@@ -119,15 +138,132 @@ _APPLY_URL_HINTS = (
     "ashbyhq.com",
 )
 
+# Cross-origin embeds that hold the real application form (Greenhouse, Lever, …).
+_ATS_FRAME_HINTS = (
+    "greenhouse",
+    "grnhse",
+    "job-boards.greenhouse",
+    "boards.greenhouse",
+    "embed/job_app",
+    "embed/job_board",
+    "jobs.lever.co",
+    "lever.co",
+    "ashbyhq.com",
+    "myworkdayjobs.com",
+    "workday.com",
+    "icims.com",
+    "smartrecruiters.com",
+    "jobvite.com",
+    "applytojob.com",
+    "workable.com",
+    "bamboohr.com",
+    "greenhouse.io",
+)
+
+_CAPTCHA_FRAME_HINTS = (
+    "recaptcha",
+    "hcaptcha",
+    "turnstile",
+    "challenges.cloudflare",
+    "googletagmanager",
+    "google.com/recaptcha",
+    "recaptcha.net",
+)
+
+# Career-site shells often mount the ATS iframe at 0×0 / display:none until a
+# detail route; promote those so coordinate clicks can reach the form.
+_MIN_HIDDEN_ATS_FORM_CONTROLS = 3
+_MIN_VISIBLE_IFRAME_EDGE_PX = 40
+
 
 def _is_apply_like_url(url: str) -> bool:
     lowered = (url or "").lower()
     return any(hint in lowered for hint in _APPLY_URL_HINTS)
 
 
+def _frame_looks_like_captcha(url: str, name: str = "") -> bool:
+    blob = f"{url or ''} {name or ''}".lower()
+    return any(hint in blob for hint in _CAPTCHA_FRAME_HINTS)
+
+
+def _frame_looks_like_ats(url: str, name: str = "") -> bool:
+    """True for Greenhouse/Lever/etc. application embeds (not captcha widgets)."""
+    if _frame_looks_like_captcha(url, name):
+        return False
+    blob = f"{url or ''} {name or ''}".lower()
+    if name and name.lower() in {"grnhse_iframe", "grnhse_app"}:
+        return True
+    return any(hint in blob for hint in _ATS_FRAME_HINTS)
+
+
 def _is_blank_url(url: str) -> bool:
     lowered = (url or "").strip().lower()
     return not lowered or lowered in {"about:blank", "about:newtab", "chrome://newtab/"}
+
+
+# Native Open/Save pickers steal OS focus; Playwright page Escape often never reaches them.
+_FILE_DIALOG_TITLE_RE = re.compile(
+    r"(^open$|^save$|file upload|upload file|choose file|select file|"
+    r"open file|save as|abrir|ouvrir|datei)",
+    re.IGNORECASE,
+)
+
+
+def is_file_dialog_title(title: str) -> bool:
+    """True when a window title looks like an OS file Open/Save/Upload picker."""
+    text = (title or "").strip()
+    if not text:
+        return False
+    return bool(_FILE_DIALOG_TITLE_RE.search(text))
+
+
+def close_native_file_dialogs() -> int:
+    """Best-effort close of stuck OS file pickers. Returns how many windows closed.
+
+    On Windows, Playwright keyboard events target the page — not the native
+    `#32770` Open dialog — so Escape via page.keyboard often leaves the picker up.
+    """
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return 0
+
+    user32 = ctypes.windll.user32
+    WM_CLOSE = 0x0010
+    handles: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_proc(hwnd: int, _lparam: int) -> bool:
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = int(user32.GetWindowTextLengthW(hwnd))
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            if is_file_dialog_title(buf.value):
+                handles.append(int(hwnd))
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(_enum_proc, 0)
+    except Exception:
+        return 0
+
+    closed = 0
+    for hwnd in handles:
+        try:
+            if user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
+                closed += 1
+        except Exception:
+            pass
+    return closed
 
 
 def resume_preview_enabled() -> bool:
@@ -259,8 +395,29 @@ class LocalCamoufoxComputer(AsyncComputer):
         # Form fill ledger for Landed Q&A (typed log + end-of-run DOM scrape).
         self._last_focus_meta: dict[str, Any] | None = None
         self._typed_fills: dict[str, dict[str, Any]] = {}
+        self._leave_open_on_exit = False
+        self._ephemeral_profile = False
+        # URL where we successfully unhid an ATS iframe (skip further reveals).
+        self._revealed_ats_for_url: str | None = None
+        # Misses per URL — stop rechecking after a few empty polls.
+        self._ats_reveal_miss_url: str | None = None
+        self._ats_reveal_miss_count: int = 0
+
+    def leave_browser_open(self) -> None:
+        """Keep Camoufox open after this apply (needs_human review)."""
+        self._leave_open_on_exit = True
 
     async def __aenter__(self):
+        # Firefox locks user_data_dir — if a needs_human review window is still
+        # open, run this apply on a separate work profile (seeded from cookies).
+        if has_orphaned_browsers():
+            self._profile_dir = _allocate_work_profile()
+            self._ephemeral_profile = True
+            print(
+                "KEEP_BROWSER_ON_NEEDS_HUMAN: review window still open; "
+                f"starting this apply on separate profile {self._profile_dir}",
+                flush=True,
+            )
         self._camoufox = AsyncCamoufox(
             **_camoufox_kwargs(self._profile_dir, addons=self._nopecha_addons)
         )
@@ -279,7 +436,10 @@ class LocalCamoufoxComputer(AsyncComputer):
         self._attach_page_guards(self._page)
         for extra in self._context.pages[1:]:
             self._attach_page_guards(extra)
+        if self._ephemeral_profile:
+            await _load_storage_state_into_context(self._context, DEFAULT_STORAGE_STATE)
         await self._page.goto(self._start_url, wait_until="domcontentloaded")
+        await self._maybe_reveal_hidden_ats_forms(self._page, force=True)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -288,8 +448,27 @@ class LocalCamoufoxComputer(AsyncComputer):
                 await self._context.storage_state(path=str(DEFAULT_STORAGE_STATE))
             except Exception:
                 pass
+        if self._leave_open_on_exit and self._camoufox is not None:
+            _orphaned_camoufox.append(
+                _OrphanSession(
+                    fox=self._camoufox,
+                    profile_dir=Path(self._profile_dir),
+                    ephemeral=self._ephemeral_profile,
+                )
+            )
+            print(
+                "KEEP_BROWSER_ON_NEEDS_HUMAN: leaving Camoufox open for review "
+                "(job will finish as needs_human; not waiting for Enter).",
+                flush=True,
+            )
+            self._camoufox = None
+            self._context = None
+            self._page = None
+            return None
         if self._camoufox is not None:
             await self._camoufox.__aexit__(exc_type, exc_val, exc_tb)
+            if self._ephemeral_profile:
+                _remove_work_profile(Path(self._profile_dir))
         return None
 
     def _on_new_page(self, page: Page) -> None:
@@ -346,8 +525,20 @@ class LocalCamoufoxComputer(AsyncComputer):
             print(f"File chooser resume attach failed: {exc}", flush=True)
             await self._dismiss_file_dialog()
 
+    async def _close_native_file_dialogs_only(self) -> None:
+        """Close OS file pickers without sending Escape (Escape dismisses in-page UI)."""
+        closed = 0
+        try:
+            closed = await asyncio.to_thread(close_native_file_dialogs)
+        except Exception:
+            closed = 0
+        if closed:
+            print(f"Closed {closed} native file dialog window(s).", flush=True)
+
     async def _dismiss_file_dialog(self) -> None:
-        """Best-effort close of a stuck native file picker (Escape)."""
+        """Best-effort close of a stuck native file picker (OS close + Escape fallback)."""
+        await self._close_native_file_dialogs_only()
+
         page = self._page
         if page is None or page.is_closed():
             return
@@ -596,7 +787,20 @@ class LocalCamoufoxComputer(AsyncComputer):
         page = await self._sync_active_page()
         # Do not wait for captcha here — invisible widgets exist early on many ATS
         # pages and would stall the whole fill flow. Solver wait is armed after Submit.
+        await self._maybe_reveal_hidden_ats_forms(page)
         await self._try_attach_resume()
+        # Native pickers are invisible in page screenshots; close OS dialogs only
+        # (no Escape — that would also dismiss in-page dropdowns/modals).
+        if self._resume_attached:
+            try:
+                closed = await asyncio.to_thread(close_native_file_dialogs)
+                if closed:
+                    print(
+                        f"Closed {closed} native file dialog window(s).",
+                        flush=True,
+                    )
+            except Exception:
+                pass
         # Viewport only for the model — full-page evidence is captured separately for Landed.
         png_bytes = await page.screenshot(full_page=False)
         return base64.b64encode(png_bytes).decode("utf-8")
@@ -610,12 +814,19 @@ class LocalCamoufoxComputer(AsyncComputer):
         if page.is_closed():
             return None
         url = page.url or ""
-        # Scroll to top so the stitch starts at the document head.
+        # Scroll to top so the stitch starts at the document head, then restore
+        # so the agent's next click (usually Submit at the bottom) still lands.
+        scroll_y = 0
         try:
+            scroll_y = int(
+                await page.evaluate("() => window.scrollY || window.pageYOffset || 0")
+                or 0
+            )
             await page.evaluate("window.scrollTo(0, 0)")
             await asyncio.sleep(0.2)
         except Exception:
             pass
+        data_out: bytes | None = None
         for quality in (80, 65, 50, 35):
             try:
                 data = await page.screenshot(
@@ -634,14 +845,57 @@ class LocalCamoufoxComputer(AsyncComputer):
                     f"Full-page screenshot: {len(data)} bytes (jpeg q={quality})",
                     flush=True,
                 )
-                return data, url
+                data_out = data
+                break
             print(
                 f"Full-page screenshot {len(data)} bytes exceeds Landed limit; "
                 f"retrying lower quality (was q={quality})",
                 flush=True,
             )
-        print("Full-page screenshot could not fit under Landed 15MB limit.", flush=True)
-        return None
+        try:
+            await page.evaluate(f"window.scrollTo(0, {max(0, scroll_y)})")
+            await asyncio.sleep(0.15)
+        except Exception:
+            pass
+        if data_out is None:
+            print("Full-page screenshot could not fit under Landed 15MB limit.", flush=True)
+            return None
+        return data_out, url
+
+    async def _scroll_submit_into_view(self, page: Page) -> bool:
+        """Bring Submit/Apply into view after full-page capture scrolls the page."""
+        script = """() => {
+          const nodes = [...document.querySelectorAll(
+            'button, input[type="submit"], [role="button"], a'
+          )];
+          const match = nodes.find((el) => {
+            const t = (
+              (el.innerText || el.value || el.getAttribute('aria-label') || '')
+            ).toLowerCase();
+            return /\\b(submit application|send application|complete application|apply now|submit|send)\\b/.test(t)
+              && !/\\b(next|continue|save)\\b/.test(t)
+              && !el.disabled;
+          });
+          if (!match) {
+            window.scrollTo(0, document.body.scrollHeight || 0);
+            return false;
+          }
+          match.scrollIntoView({ block: 'center', inline: 'nearest' });
+          return true;
+        }"""
+        for frame in await self._iter_frames(page):
+            try:
+                if await frame.evaluate(script):
+                    return True
+            except Exception:
+                continue
+        try:
+            await page.evaluate(
+                "window.scrollTo(0, document.body.scrollHeight || document.documentElement.scrollHeight || 0)"
+            )
+        except Exception:
+            return False
+        return False
 
     async def capture_page_evidence(self) -> dict[str, Any]:
         """Page text + URLs for Landed SubmissionVerifier (finish confirmation)."""
@@ -821,6 +1075,18 @@ class LocalCamoufoxComputer(AsyncComputer):
             await self._try_attach_resume()
             submit_like = await self._click_looks_like_submit(page, x, y)
             upload_like = await self._click_looks_like_upload(page, x, y)
+            # After set_input_files, an Upload click still opens a Windows picker
+            # that page screenshots cannot see. Close the OS dialog only — never
+            # Escape here (that blurs inputs / closes Greenhouse dropdowns).
+            if upload_like and self._resume_attached:
+                await self._close_native_file_dialogs_only()
+                name = self._resume_path.name if self._resume_path else "resume.pdf"
+                print(
+                    f"Skipped Upload/Attach click — resume already attached ({name}).",
+                    flush=True,
+                )
+                return
+
             if submit_like:
                 try:
                     self._url_before_submit = page.url
@@ -834,10 +1100,10 @@ class LocalCamoufoxComputer(AsyncComputer):
             page = await self._sync_active_page()
             await self._remember_focus_meta(page)
             await self._try_attach_resume()
-            # Re-clicking Upload after attach often opens a native picker that
-            # Playwright cannot always auto-close — Escape only for upload clicks.
+            # If the click opened a native picker (attach via chooser / race), close
+            # the OS window only — do not Escape (kills in-page focus/modals).
             if self._resume_attached and upload_like:
-                await self._dismiss_file_dialog()
+                await self._close_native_file_dialogs_only()
             # Only arm on Submit/Continue clicks. Many ATS pages (JazzHR) keep a
             # visible reCAPTCHA on the form the whole time — arming on presence
             # blocks the agent for 90s before fields are filled.
@@ -882,28 +1148,42 @@ class LocalCamoufoxComputer(AsyncComputer):
         await self._with_live_page("type", _do)
 
     async def _click_looks_like_submit(self, page: Page, x: int, y: int) -> bool:
-        """True when the click target is Submit / Apply / Continue (captcha often follows)."""
+        """True when the click target is Submit / Apply / Continue (captcha often follows).
+
+        Own-label text only — parent ``innerText`` would match any field inside a
+        form that also contains a Submit button.
+        """
         try:
             return bool(
                 await page.evaluate(
                     """([x, y]) => {
                       const el = document.elementFromPoint(x, y);
                       if (!el) return false;
-                      const chain = [];
+                      const submitRe = /\\b(submit application|send application|complete application|apply now|submit|send|finish|continue|next|verify)\\b/;
                       let n = el;
-                      for (let i = 0; i < 5 && n; i++, n = n.parentElement) chain.push(n);
-                      const blob = chain.map((node) => [
-                        node.innerText || '',
-                        node.value || '',
-                        node.getAttribute?.('aria-label') || '',
-                        node.getAttribute?.('name') || '',
-                        node.id || '',
-                        node.type || '',
-                      ].join(' ')).join(' ').toLowerCase();
-                      if (/\\b(submit|apply now|submit application|send application|finish|complete application|continue|next|verify)\\b/.test(blob)) {
-                        return true;
+                      for (let i = 0; i < 6 && n; i++, n = n.parentElement) {
+                        const type = (n.type || '').toLowerCase();
+                        if (type === 'submit') return true;
+                        const tag = (n.tagName || '').toLowerCase();
+                        const role = (n.getAttribute?.('role') || '').toLowerCase();
+                        const buttonLike = (
+                          tag === 'button' || tag === 'a'
+                          || role === 'button'
+                          || (tag === 'input' && /^(button|submit)$/.test(type))
+                          || (typeof n.className === 'string' && /\\b(btn|button)\\b/i.test(n.className))
+                        );
+                        if (!buttonLike) continue;
+                        const own = [
+                          n.getAttribute?.('aria-label') || '',
+                          n.getAttribute?.('title') || '',
+                          n.getAttribute?.('name') || '',
+                          n.id || '',
+                          n.value || '',
+                          (n.innerText || n.textContent || '').trim().slice(0, 120),
+                        ].join(' ').toLowerCase();
+                        if (submitRe.test(own)) return true;
                       }
-                      return chain.some((node) => (node.type || '').toLowerCase() === 'submit');
+                      return false;
                     }""",
                     [x, y],
                 )
@@ -1008,34 +1288,67 @@ class LocalCamoufoxComputer(AsyncComputer):
                 print(f"Pre-submit screenshot callback failed: {exc}", flush=True)
                 return f"FAILED: upload callback error ({exc})"
         self._pre_submit_screenshot_taken = True
+        # Full-page capture scrolls to y=0; put Submit back in view for the next click.
+        try:
+            page = await self._sync_active_page()
+            await self._scroll_submit_into_view(page)
+        except Exception:
+            pass
         print("Captured full-page screenshot before Submit.", flush=True)
-        return f"CAPTURED: full-page screenshot saved ({len(data)} bytes)"
+        return (
+            f"CAPTURED: full-page screenshot saved ({len(data)} bytes). "
+            "Viewport was scrolled for the stitch — scroll is restored toward "
+            "Submit/Apply; scroll down to the submit button if needed, then click it "
+            "(do not click using pre-screenshot bottom coordinates)."
+        )
 
     async def _click_looks_like_upload(self, page: Page, x: int, y: int) -> bool:
-        """True when the click target is Upload / Attach / Choose file (opens OS picker)."""
+        """True when the click target is Upload / Attach / Choose file (opens OS picker).
+
+        Do not use parent ``innerText`` — that includes the whole form (e.g. a
+        Greenhouse section that says \"Upload a resume\"), so every field click
+        looked like upload, got skipped, and Escape killed focus/typing.
+        """
         try:
             return bool(
                 await page.evaluate(
                     """([x, y]) => {
                       const el = document.elementFromPoint(x, y);
                       if (!el) return false;
-                      const chain = [];
+                      const uploadRe = /\\b(upload|attach|choose file|browse|select file)\\b|drop[\\s\\S]{0,40}(resume|cv|file)|(resume|cv)[\\s\\S]{0,40}upload/;
                       let n = el;
-                      for (let i = 0; i < 5 && n; i++, n = n.parentElement) chain.push(n);
-                      const blob = chain.map((node) => [
-                        node.innerText || '',
-                        node.value || '',
-                        node.getAttribute?.('aria-label') || '',
-                        node.getAttribute?.('name') || '',
-                        node.id || '',
-                        node.className || '',
-                        node.type || '',
-                        node.tagName || '',
-                      ].join(' ')).join(' ').toLowerCase();
-                      if (/\\b(upload|attach|choose file|browse|select file|drop.*(resume|cv|file)|resume.*upload)\\b/.test(blob)) {
-                        return true;
+                      for (let i = 0; i < 6 && n; i++, n = n.parentElement) {
+                        const type = (n.type || '').toLowerCase();
+                        if (type === 'file') return true;
+                        const tag = (n.tagName || '').toLowerCase();
+                        const role = (n.getAttribute?.('role') || '').toLowerCase();
+                        const buttonLike = (
+                          tag === 'button' || tag === 'a' || tag === 'label'
+                          || role === 'button'
+                          || (tag === 'input' && /^(button|submit|file)$/.test(type))
+                          || (typeof n.className === 'string' && /\\b(btn|button|upload|dropzone|file-upload)\\b/i.test(n.className))
+                        );
+                        // Own labels only — never parent container innerText (whole form).
+                        const ownParts = [
+                          n.getAttribute?.('aria-label') || '',
+                          n.getAttribute?.('title') || '',
+                          n.getAttribute?.('data-automation-id') || '',
+                          n.getAttribute?.('name') || '',
+                          n.id || '',
+                          typeof n.className === 'string' ? n.className : '',
+                          n.value || '',
+                        ];
+                        if (buttonLike) {
+                          const ownText = (n.innerText || n.textContent || '').trim();
+                          // Tiny controls only — large sections are form wrappers.
+                          if (ownText.length > 0 && ownText.length < 160) {
+                            ownParts.push(ownText);
+                          }
+                        }
+                        const own = ownParts.join(' ').toLowerCase();
+                        if (uploadRe.test(own)) return true;
                       }
-                      return chain.some((node) => (node.type || '').toLowerCase() === 'file');
+                      return false;
                     }""",
                     [x, y],
                 )
@@ -1105,6 +1418,270 @@ class LocalCamoufoxComputer(AsyncComputer):
                 frames.append(frame)
         return frames
 
+    _REVEAL_HIDDEN_ATS_IFRAME_JS = """(targets) => {
+      const minEdge = 40;
+      const revealed = [];
+      const iframes = [...document.querySelectorAll('iframe')];
+      for (const t of targets || []) {
+        const id = (t.id || '').toLowerCase();
+        const name = (t.name || '').toLowerCase();
+        const srcNeedle = (t.srcIncludes || '').toLowerCase();
+        const match = iframes.find((f) => {
+          const fid = (f.id || '').toLowerCase();
+          const fname = (f.name || '').toLowerCase();
+          const fsrc = (f.src || '').toLowerCase();
+          if (id && fid === id) return true;
+          if (name && (fname === name || fid === name)) return true;
+          if (srcNeedle && fsrc.includes(srcNeedle)) return true;
+          return false;
+        });
+        if (!match) continue;
+        const before = {
+          w: match.offsetWidth,
+          h: match.offsetHeight,
+          display: getComputedStyle(match).display,
+          visibility: getComputedStyle(match).visibility,
+        };
+        let n = match;
+        for (let i = 0; i < 10 && n; i++, n = n.parentElement) {
+          n.classList.remove(
+            'is-hidden', 'hidden', 'w-condition-invisible', 'hide', 'd-none', 'invisible'
+          );
+          if ('hidden' in n) n.hidden = false;
+          if (n.getAttribute && n.getAttribute('aria-hidden') === 'true') {
+            n.setAttribute('aria-hidden', 'false');
+          }
+          if (n.style) {
+            if (n.style.display === 'none') n.style.display = '';
+            if (n.style.visibility === 'hidden') n.style.visibility = 'visible';
+            if (n.style.opacity === '0') n.style.opacity = '';
+            if (n.style.height === '0px' || n.style.height === '0') n.style.height = '';
+            if (n.style.maxHeight === '0px' || n.style.maxHeight === '0') n.style.maxHeight = '';
+          }
+          try {
+            const cs = getComputedStyle(n);
+            if (cs.display === 'none') n.style.setProperty('display', 'block', 'important');
+            if (cs.visibility === 'hidden') {
+              n.style.setProperty('visibility', 'visible', 'important');
+            }
+            if (cs.opacity === '0') n.style.setProperty('opacity', '1', 'important');
+          } catch (_) {}
+        }
+        match.style.setProperty('display', 'block', 'important');
+        match.style.setProperty('visibility', 'visible', 'important');
+        match.style.setProperty('opacity', '1', 'important');
+        match.style.setProperty('width', '100%', 'important');
+        match.style.setProperty('min-width', '320px', 'important');
+        match.style.setProperty('min-height', '2400px', 'important');
+        if (match.offsetHeight < minEdge) {
+          match.style.setProperty('height', '2400px', 'important');
+        }
+        match.removeAttribute('hidden');
+        revealed.push({
+          id: match.id || '',
+          name: match.name || '',
+          src: (match.src || '').slice(0, 160),
+          before,
+          after: { w: match.offsetWidth, h: match.offsetHeight },
+        });
+      }
+      return revealed;
+    }"""
+
+    async def _maybe_reveal_hidden_ats_forms(
+        self, page: Page, *, force: bool = False
+    ) -> int:
+        """Unhide zero-size / CSS-hidden ATS application iframes (Greenhouse embeds, etc.).
+
+        Career marketing pages often mount the real form in a cross-origin iframe at
+        0×0 (or ``display:none`` ancestors). Inputs exist in the frame DOM, but
+        screenshot clicks never hit them. Unhiding + sizing the iframe is general
+        across hosts — do not navigate to embed URLs (tokens are parent-scoped).
+        """
+        if page.is_closed():
+            return 0
+        try:
+            url = str(page.url or "")
+        except Exception:
+            return 0
+        if url and url == self._revealed_ats_for_url:
+            return 0
+        if (
+            not force
+            and url
+            and url == self._ats_reveal_miss_url
+            and self._ats_reveal_miss_count >= 5
+        ):
+            return 0
+
+        revealed_total = 0
+        # Embed scripts need a beat after domcontentloaded (force=initial navigation).
+        polls = 5 if force else 1
+        for attempt in range(polls):
+            targets = await self._hidden_ats_iframe_targets(page)
+            if targets:
+                try:
+                    revealed = await page.evaluate(
+                        self._REVEAL_HIDDEN_ATS_IFRAME_JS, targets
+                    )
+                except Exception as exc:
+                    print(f"Hidden ATS iframe reveal failed: {exc}", flush=True)
+                    revealed = []
+                if isinstance(revealed, list) and revealed:
+                    revealed_total = len(revealed)
+                    for item in revealed:
+                        before = item.get("before") or {}
+                        after = item.get("after") or {}
+                        print(
+                            "Revealed hidden ATS application iframe "
+                            f"id={item.get('id')!r} "
+                            f"{before.get('w')}x{before.get('h')} -> "
+                            f"{after.get('w')}x{after.get('h')} "
+                            f"src={(item.get('src') or '')[:100]}",
+                            flush=True,
+                        )
+                    break
+            if attempt < polls - 1:
+                await asyncio.sleep(1.0)
+
+        if revealed_total > 0:
+            self._revealed_ats_for_url = url
+            self._ats_reveal_miss_url = None
+            self._ats_reveal_miss_count = 0
+        else:
+            if url == self._ats_reveal_miss_url:
+                self._ats_reveal_miss_count += 1
+            else:
+                self._ats_reveal_miss_url = url
+                self._ats_reveal_miss_count = 1
+        return revealed_total
+
+    async def _hidden_ats_iframe_targets(self, page: Page) -> list[dict[str, str]]:
+        """Return iframe match keys for ATS frames that have forms but are not visible."""
+        try:
+            geometry = await page.evaluate(
+                """() => [...document.querySelectorAll('iframe')].map((f) => {
+                  const cs = getComputedStyle(f);
+                  let ancestorHidden = false;
+                  for (let n = f.parentElement, i = 0; n && i < 8; i++, n = n.parentElement) {
+                    const c = getComputedStyle(n);
+                    if (
+                      c.display === 'none' || c.visibility === 'hidden' || c.opacity === '0'
+                      || n.hidden || n.classList.contains('is-hidden')
+                      || n.classList.contains('w-condition-invisible')
+                    ) {
+                      ancestorHidden = true;
+                      break;
+                    }
+                  }
+                  return {
+                    id: f.id || '',
+                    name: f.name || '',
+                    src: f.src || '',
+                    w: f.offsetWidth,
+                    h: f.offsetHeight,
+                    display: cs.display,
+                    visibility: cs.visibility,
+                    opacity: cs.opacity,
+                    ancestorHidden,
+                  };
+                })"""
+            )
+        except Exception:
+            geometry = []
+        if not isinstance(geometry, list):
+            geometry = []
+
+        geo_by_key: dict[str, dict[str, Any]] = {}
+        for g in geometry:
+            if not isinstance(g, dict):
+                continue
+            for key in (
+                str(g.get("id") or ""),
+                str(g.get("name") or ""),
+                str(g.get("src") or "")[:120],
+            ):
+                if key:
+                    geo_by_key[key.lower()] = g
+
+        targets: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for frame in page.frames:
+            try:
+                if frame == page.main_frame:
+                    continue
+            except Exception:
+                pass
+            frame_url = ""
+            frame_name = ""
+            try:
+                frame_url = str(frame.url or "")
+                frame_name = str(frame.name or "")
+            except Exception:
+                continue
+            if not _frame_looks_like_ats(frame_url, frame_name):
+                continue
+            try:
+                controls = await frame.locator("input, textarea, select").count()
+            except Exception:
+                controls = 0
+            if controls < _MIN_HIDDEN_ATS_FORM_CONTROLS:
+                continue
+
+            geo = (
+                geo_by_key.get(frame_name.lower())
+                or geo_by_key.get(frame_url[:120].lower())
+                or None
+            )
+            if geo is None:
+                # Fallback: any iframe whose src shares host with the frame.
+                try:
+                    host = (urlparse(frame_url).hostname or "").lower()
+                except Exception:
+                    host = ""
+                if host:
+                    for g in geometry:
+                        src = str(g.get("src") or "").lower()
+                        if host in src:
+                            geo = g
+                            break
+            if not isinstance(geo, dict):
+                continue
+
+            w = int(geo.get("w") or 0)
+            h = int(geo.get("h") or 0)
+            hidden = bool(geo.get("ancestorHidden")) or (
+                w < _MIN_VISIBLE_IFRAME_EDGE_PX
+                or h < _MIN_VISIBLE_IFRAME_EDGE_PX
+                or str(geo.get("display") or "") == "none"
+                or str(geo.get("visibility") or "") == "hidden"
+                or str(geo.get("opacity") or "") == "0"
+            )
+            if not hidden:
+                continue
+
+            target = {
+                "id": str(geo.get("id") or ""),
+                "name": str(geo.get("name") or frame_name or ""),
+                "srcIncludes": "",
+            }
+            src = str(geo.get("src") or frame_url or "")
+            try:
+                host = (urlparse(src).hostname or "").lower()
+            except Exception:
+                host = ""
+            if host:
+                target["srcIncludes"] = host
+            elif src:
+                target["srcIncludes"] = src[:80]
+
+            dedupe = f"{target['id']}|{target['name']}|{target['srcIncludes']}"
+            if dedupe in seen:
+                continue
+            seen.add(dedupe)
+            targets.append(target)
+        return targets
+
     async def _detect_interactive_captcha(self, page: Page) -> str | None:
         """Visible interactive challenge only — ignore badges / invisible widgets / early sitekeys.
 
@@ -1171,15 +1748,45 @@ class LocalCamoufoxComputer(AsyncComputer):
     async def _find_hcaptcha_context(
         self, page: Page
     ) -> tuple[Frame, dict[str, Any]] | None:
-        """Frame that hosts the widget + extracted sitekey metadata."""
+        """Frame that hosts the widget + extracted sitekey metadata.
+
+        Prefer a frame whose document owns ``data-sitekey`` / form fields (usually
+        the ATS host), not the cross-origin hCaptcha challenge iframe.
+        """
+        fallback: tuple[Frame, dict[str, Any]] | None = None
         for frame in await self._iter_frames(page):
             try:
                 meta = await frame.evaluate(EXTRACT_HCAPTCHA_JS)
             except Exception:
                 continue
-            if isinstance(meta, dict) and meta.get("sitekey"):
+            if not isinstance(meta, dict) or not meta.get("sitekey"):
+                continue
+            source = str(meta.get("source") or "")
+            if source in {"data-sitekey", "html"}:
                 return frame, meta
-        return None
+            if fallback is None:
+                fallback = (frame, meta)
+        return fallback
+
+    async def _diagnose_hcaptcha_miss(self, page: Page) -> None:
+        """Log iframe/host clues when sitekey extraction fails."""
+        for frame in await self._iter_frames(page):
+            try:
+                info = await frame.evaluate(DIAGNOSE_HCAPTCHA_JS)
+            except Exception:
+                continue
+            if not isinstance(info, dict):
+                continue
+            iframes = info.get("iframes") or []
+            hosts = info.get("hosts") or []
+            if not iframes and not hosts and not info.get("hasHcaptchaApi"):
+                continue
+            print(
+                f"NoneCap diagnose: frame={str(info.get('href') or '')[:120]} "
+                f"api={info.get('hasHcaptchaApi')} hosts={hosts!r} "
+                f"iframes={iframes!r}",
+                flush=True,
+            )
 
     async def _solve_hcaptcha_with_nonecap(self, page: Page) -> bool:
         """Mint a P1_ token via NoneCap and inject it into the form. Returns True on success."""
@@ -1188,17 +1795,21 @@ class LocalCamoufoxComputer(AsyncComputer):
         found = await self._find_hcaptcha_context(page)
         if not found:
             print("NoneCap: no hCaptcha sitekey on page (checked all frames).", flush=True)
+            await self._diagnose_hcaptcha_miss(page)
             return False
         frame, meta = found
 
         sitekey = str(meta["sitekey"])
         rqdata = meta.get("rqdata") or None
         user_agent = str(meta.get("userAgent") or "") or None
-        # Prefer the frame URL (iCIMS embed) so the token matches the host that loads the widget.
-        solve_url = frame.url or page.url
+        # Prefer the host page URL (token must match the page that posts the form).
+        solve_url = page.url or frame.url
+        if "hcaptcha.com" in (frame.url or "") and page.url:
+            solve_url = page.url
         print(
             f"NoneCap: solving hCaptcha sitekey={sitekey[:8]}… "
-            f"({'enterprise' if rqdata else 'standard'}; ua=browser; frame={solve_url[:80]})",
+            f"({'enterprise' if rqdata else 'standard'}; "
+            f"source={meta.get('source')}; url={solve_url[:80]})",
             flush=True,
         )
         try:
@@ -1220,24 +1831,45 @@ class LocalCamoufoxComputer(AsyncComputer):
             print("NoneCap: empty token in response.", flush=True)
             return False
 
-        # Camoufox: ``mw:`` scripts must be self-contained IIFEs — Playwright args
-        # are not passed through the main-world bridge (that caused filled=False).
+        # Inject on every same-origin frame that can hold response fields.
         script = build_inject_token_script(token, str(resp_key) if resp_key else None)
         inject_result: Any = None
-        try:
-            inject_result = await frame.evaluate("mw:" + script)
-        except Exception as mw_exc:
-            print(f"NoneCap: main-world inject failed ({mw_exc}); trying page world…", flush=True)
+        filled = False
+        for target in await self._iter_frames(page):
             try:
-                inject_result = await frame.evaluate(script)
-            except Exception as exc:
-                print(f"NoneCap: token inject failed: {exc}", flush=True)
-                return False
+                inject_result = await target.evaluate("mw:" + script)
+            except Exception:
+                try:
+                    inject_result = await target.evaluate(script)
+                except Exception:
+                    continue
+            if await self._hcaptcha_token_present(target) or (
+                isinstance(inject_result, dict) and inject_result.get("filled")
+            ):
+                filled = True
+                frame = target
+                break
 
-        filled = bool(
-            (isinstance(inject_result, dict) and inject_result.get("filled"))
-            or await self._hcaptcha_token_present(frame)
-        )
+        if not filled:
+            # Last resort: original extraction frame.
+            try:
+                inject_result = await frame.evaluate("mw:" + script)
+            except Exception as mw_exc:
+                print(
+                    f"NoneCap: main-world inject failed ({mw_exc}); trying page world…",
+                    flush=True,
+                )
+                try:
+                    inject_result = await frame.evaluate(script)
+                except Exception as exc:
+                    print(f"NoneCap: token inject failed: {exc}", flush=True)
+                    return False
+            filled = bool(
+                (isinstance(inject_result, dict) and inject_result.get("filled"))
+                or await self._hcaptcha_token_present(frame)
+                or await self._captcha_token_present_any(page)
+            )
+
         print(
             f"NoneCap: injected hCaptcha token (solve_id={solve.get('id')}, "
             f"filled={filled}, resp_key={'yes' if resp_key else 'no'}, "
@@ -1251,12 +1883,46 @@ class LocalCamoufoxComputer(AsyncComputer):
             )
             return False
 
-        # Lever shows the image puzzle until submit is retried with the token present.
+        # Lever/Recruitee show the image puzzle until submit is retried with the token.
         await asyncio.sleep(0.5)
         if await self._click_submit_again(page):
             print("NoneCap: re-clicked Submit after token inject.", flush=True)
             await asyncio.sleep(1.5)
         return True
+
+    async def solve_hcaptcha_now(self) -> str:
+        """Agent-facing NoneCap solve. Does not require prior submit-arming."""
+        if not nonecap_enabled():
+            return (
+                "DISABLED: NONECAP_KEY is not set. "
+                "Add NONECAP_KEY=nc_live_… to .env (https://dashboard.nonecap.com)."
+            )
+        page = await self._sync_active_page()
+        if await self._captcha_token_present_any(page):
+            return "ALREADY_SOLVED: h-captcha-response already has a token"
+        kind = await self._detect_interactive_captcha(page)
+        if kind and kind != "HCAPTCHA":
+            return (
+                f"NOT_HCAPTCHA: detected {kind}. "
+                "Use wait for NopeCHA (Turnstile/reCAPTCHA/Cloudflare), not this tool."
+            )
+        # Allow solve even when detection is unsure — sitekey extraction is authoritative.
+        self._captcha_armed = True
+        self._captcha_wait_exhausted = False
+        ok = await self._solve_hcaptcha_with_nonecap(page)
+        if ok:
+            self._captcha_armed = False
+            return "SOLVED: NoneCap token injected; continue or re-click Submit if needed"
+        found = await self._find_hcaptcha_context(page)
+        if not found:
+            return (
+                "NO_SITEKEY: no hCaptcha sitekey found in any frame. "
+                "If an image challenge is visible but not hCaptcha, stop and report blocked."
+            )
+        return (
+            "FAILED: NoneCap could not clear hCaptcha "
+            "(API error, inject failed, or credits). Check terminal logs."
+        )
 
     async def _click_recaptcha_checkbox(self, page: Page) -> bool:
         """Open the reCAPTCHA challenge so NopeCHA (auto_solve, not auto_open) can run.
@@ -1558,6 +2224,21 @@ class LocalCamoufoxComputer(AsyncComputer):
                 await page.mouse.move(px, py)
             await page.mouse.up()
 
+    async def open_url(self, url: str) -> str:
+        """Navigate the active tab to an https URL (verification links from Gmail)."""
+        target = str(url or "").strip()
+        if not target.lower().startswith("https://"):
+            return f"FAILED: only https:// URLs are allowed (got {target[:80]!r})"
+        try:
+            page = await self._sync_active_page()
+            await page.goto(target, wait_until="domcontentloaded", timeout=60_000)
+            await self._maybe_reveal_hidden_ats_forms(page, force=True)
+            final = str(page.url or target)
+            print(f"Opened verification URL → {final}", flush=True)
+            return f"OPENED: {final}"
+        except Exception as exc:
+            return f"FAILED: navigate error ({exc})"
+
 
 # Exit codes from run_local_apply (worker maps these to Landed finish outcomes).
 EXIT_OK = 0
@@ -1565,6 +2246,106 @@ EXIT_FAILED = 1
 EXIT_NO_LOGIN = 2
 EXIT_NEEDS_HUMAN = 3
 EXIT_DUPLICATE = 4
+
+
+def keep_browser_on_needs_human_enabled() -> bool:
+    """When set, leave Camoufox open if the apply ends as needs_human."""
+    raw = os.getenv("KEEP_BROWSER_ON_NEEDS_HUMAN")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def has_orphaned_browsers() -> bool:
+    return bool(_orphaned_camoufox)
+
+
+def _allocate_work_profile() -> Path:
+    """Fresh profile dir for an apply while a review window holds another profile."""
+    WORK_PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
+    path = WORK_PROFILE_ROOT / uuid.uuid4().hex[:12]
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def _remove_work_profile(profile_dir: Path) -> None:
+    try:
+        if profile_dir.is_dir() and WORK_PROFILE_ROOT.resolve() in profile_dir.resolve().parents:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+    except Exception as exc:
+        print(f"Work profile cleanup failed ({profile_dir}): {exc}", flush=True)
+
+
+async def _load_storage_state_into_context(
+    context: BrowserContext, state_path: Path
+) -> None:
+    """Seed a work profile with cookies from browser-auth.json (main profile is locked)."""
+    if not state_path.is_file():
+        print(
+            f"KEEP_BROWSER_ON_NEEDS_HUMAN: no {state_path} to seed work profile "
+            "(logins may be missing until you sign in again).",
+            flush=True,
+        )
+        return
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"Could not read {state_path}: {exc}", flush=True)
+        return
+    cookies = data.get("cookies") or []
+    if not cookies:
+        print(f"{state_path} has no cookies to load into work profile.", flush=True)
+        return
+    try:
+        await context.add_cookies(cookies)
+        print(
+            f"Loaded {len(cookies)} cookie(s) from {state_path} into work profile.",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"Failed to load cookies into work profile: {exc}", flush=True)
+
+
+async def close_orphaned_browsers(*, reason: str = "") -> None:
+    """Close browsers left open by KEEP_BROWSER_ON_NEEDS_HUMAN."""
+    if not _orphaned_camoufox:
+        return
+    suffix = f" ({reason})" if reason else ""
+    print(
+        f"Closing {len(_orphaned_camoufox)} kept-open Camoufox window(s){suffix}.",
+        flush=True,
+    )
+    while _orphaned_camoufox:
+        session = _orphaned_camoufox.pop()
+        try:
+            await session.fox.__aexit__(None, None, None)
+        except Exception as exc:
+            print(f"Kept-open Camoufox close failed: {exc}", flush=True)
+        if session.ephemeral:
+            _remove_work_profile(session.profile_dir)
+
+
+async def hold_orphaned_browsers_until_interrupt() -> None:
+    """Keep the process (and open Camoufox) alive after the worker stops claiming.
+
+    Jobs are already finished/marked — this only prevents process exit from
+    tearing down a needs_human review window. Ctrl+C exits.
+    """
+    if not _orphaned_camoufox:
+        return
+    print(
+        "KEEP_BROWSER_ON_NEEDS_HUMAN: browser still open for review. "
+        "Job(s) already marked needs_human. Ctrl+C to exit (closes browser).",
+        flush=True,
+    )
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        raise
+    finally:
+        await close_orphaned_browsers(reason="process shutting down")
+
+
 # Job posting closed / expired / removed — Landed failed_permanent + adapter.posting_expired
 EXIT_POSTING_UNAVAILABLE = 5
 
@@ -1720,7 +2501,7 @@ async def run_local_apply(
     if landed_client is not None and app_id:
         verification_since = utc_now_iso()
         print(
-            f"Verification codes: Gmail poll enabled "
+            f"Verification codes/links: Gmail poll enabled "
             f"(application={app_id}, since={verification_since}"
             f"{f', company={company_name}' if company_name else ''})",
             flush=True,
@@ -1750,6 +2531,7 @@ async def run_local_apply(
         application_id=app_id or None,
         verification_since=verification_since,
         on_verification_step=on_verification_step,
+        always_fill_fields=list(config.always_fill_fields or []),
     )
 
     exit_code = 0
@@ -1893,6 +2675,12 @@ async def run_local_apply(
                     flush=True,
                 )
                 exit_code = EXIT_POSTING_UNAVAILABLE
+
+        if exit_code == EXIT_NEEDS_HUMAN and keep_browser_on_needs_human_enabled():
+            # Leave the window open for review; do not block the worker on Enter.
+            # __aexit__ will orphan Camoufox instead of closing it.
+            computer.leave_browser_open()
+        # Other statuses (or env off): __aexit__ closes Camoufox immediately.
 
     if result is not None and exit_code == 0:
         usage = _usage_from_result(result)

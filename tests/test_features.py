@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from computer_use.features import ApplyRunContext, compose, disabled_feature_names
 from computer_use.features.form_knowledge import TOOL_NAME as FORM_TOOL
+from computer_use.features.hcaptcha import TOOL_NAME as HCAPTCHA_TOOL
 from computer_use.features.learnings import TOOL_NAME as LEARN_TOOL
 from computer_use.features.pre_submit_screenshot import TOOL_NAME as SCREENSHOT_TOOL
 from computer_use.features.verification_code import TOOL_NAME as VERIFY_TOOL
@@ -32,17 +33,21 @@ def test_default_compose_includes_core_features(monkeypatch) -> None:
     assert "account_signup" in composed.names
     assert "verification_code" not in composed.names
     assert "pre_submit_screenshot" not in composed.names
+    assert "hcaptcha" not in composed.names
     names = _tool_names(composed)
     assert FORM_TOOL in names
     assert LEARN_TOOL in names
     assert VERIFY_TOOL not in names
     assert SCREENSHOT_TOOL not in names
+    assert HCAPTCHA_TOOL not in names
     blob = "\n".join(composed.user_blocks) + "\n" + composed.system_instructions
     assert "resolve_form_question" in blob
     assert "record_apply_learning" in blob
     assert "ACCOUNT SIGNUP" in blob
+    assert "record_employer_account" in blob
     assert "check_verification_code" not in blob
     assert "capture_pre_submit_screenshot" not in blob
+    assert "solve_hcaptcha" not in blob
 
 
 def test_pre_submit_screenshot_enabled_with_browser(monkeypatch) -> None:
@@ -52,15 +57,23 @@ def test_pre_submit_screenshot_enabled_with_browser(monkeypatch) -> None:
         async def capture_pre_submit_evidence(self) -> str:
             return "CAPTURED: test"
 
+        async def solve_hcaptcha_now(self) -> str:
+            return "SOLVED: test"
+
     ctx = ApplyRunContext(
         job_url="https://jobs.example.org/1",
         browser_computer=_Computer(),
     )
     composed = compose(ctx)
     assert "pre_submit_screenshot" in composed.names
-    assert SCREENSHOT_TOOL in _tool_names(composed)
+    assert "hcaptcha" in composed.names
+    names = _tool_names(composed)
+    assert SCREENSHOT_TOOL in names
+    assert HCAPTCHA_TOOL in names
     blob = "\n".join(composed.user_blocks) + "\n" + composed.system_instructions
     assert "capture_pre_submit_screenshot" in blob
+    assert "scroll" in blob.lower() and "Submit" in blob
+    assert "solve_hcaptcha" in blob
 
 
 def test_verification_enabled_with_landed_client(monkeypatch) -> None:

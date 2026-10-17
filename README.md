@@ -28,9 +28,9 @@ Put your PDF at `resume_path`. Fill `profile.email` / `profile.phone` (or set `A
 
 **Salary / compensation:** leave `profile.salary_expectation_usd` as `null` to auto-pick an annual USD figure from the job’s posted salary range (Landed claim/DB) biased by `years_experience`. Set it to a number (e.g. `120000`) to **override** that auto value for every apply.
 
-Unknown screening questions are recorded in `form_knowledge.json` (override with `FORM_KNOWLEDGE_PATH`). The agent answers from `profile` and prior KB answers first; only gaps become pending. Set each pending entry’s `answer` field to reuse it on later applies, or set `"ai_may_answer": true` to let the agent write a short answer for that question.
+Unknown screening questions are recorded in `form_knowledge.json` (override with `FORM_KNOWLEDGE_PATH`). The agent answers from `profile` and prior KB answers first; only gaps become pending. The run continues through the form until the final Submit so multiple gaps can be collected in one pass (it stops before clicking Submit/captcha when required pendings remain). Set each pending entry’s `answer` field to reuse it on later applies, or set `"ai_may_answer": true` to let the agent write a short answer for that question.
 
-`account_signup` lets the agent create an employer-site account on **non-major** companies (email in config; set `APPLY_ACCOUNT_PASSWORD` in `.env`). Major employers are skipped; Google SSO is preferred when available.
+`account_signup` lets the agent create an employer-site account on **non-major** companies (email in config; set `APPLY_ACCOUNT_PASSWORD` in `.env`). Major employers are skipped; Google SSO is preferred when available. Created logins are saved to `employer_accounts.json` (host, email, password, verified / needs_verification) so later applies Sign In instead of signing up again.
 
 ## Setup
 
@@ -80,7 +80,7 @@ Claims ready applications from Landed’s API, uses `apply.config.json` for prof
 
 API URL defaults to `http://localhost:8180`. Worker token is read from `../landed/.env` (`LANDED_WORKER_TOKEN`) — no need to duplicate it here.
 
-1. Edit `worker.config.json` — one `blocklist` (e.g. `linkedin`, `workday`) blocks both adapter and URL host
+1. Optionally set `WORKER_BLOCKLIST` / `WORKER_ALLOWLIST` in `.env` (comma-separated, e.g. `linkedin,workday`) — or the same keys in `worker.config.json`. Omitted/empty means block nothing / allow any.
 2. Stop Landed’s Node browser-worker so only this process claims jobs
 3. Run:
 

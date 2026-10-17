@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from computer_use.features.form_knowledge import (
     ai_may_answer_entries,
     answer_from_profile,
     answered_entries,
+    autofill_required_enabled,
     is_ai_generatable_question,
     lookup_answer,
     normalize_question,
@@ -63,7 +66,10 @@ def test_lookup_answer_only_when_filled(tmp_path: Path) -> None:
     assert hit["answer"] == "No"
 
 
-def test_resolve_prefers_kb_then_profile_before_pending(tmp_path: Path) -> None:
+def test_resolve_prefers_kb_then_profile_before_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("APPLY_AUTOFILL_REQUIRED", raising=False)
     path = tmp_path / "kb.json"
     profile = {
         "email": "jared@example.com",
@@ -99,6 +105,8 @@ def test_resolve_prefers_kb_then_profile_before_pending(tmp_path: Path) -> None:
         path=path,
     )
     assert msg3.startswith("RECORDED_PENDING:")
+    assert "do not stop now" in msg3.lower()
+    assert "stop and report" not in msg3.lower()
     assert pending_count(path) == 1
 
     # Fill answer; next resolve returns it
@@ -121,8 +129,72 @@ def test_answer_from_profile_sponsorship_hint() -> None:
     ) == "No"
 
 
-def test_state_not_matched_inside_state_healthcare(tmp_path: Path) -> None:
+def test_relatives_empty_means_no() -> None:
+    assert (
+        answer_from_profile(
+            "Do you have any relatives working for this company?",
+            {"relatives": []},
+            options=["Yes", "No"],
+        )
+        == "No"
+    )
+    # Missing relatives key → same as none
+    assert (
+        answer_from_profile(
+            "Do you have a family relationship or close personal relationship "
+            "with anyone employed here?",
+            {},
+            options=["Yes", "No"],
+        )
+        == "No"
+    )
+    assert (
+        answer_from_profile(
+            "List any relatives employed by the company",
+            {"relatives": []},
+        )
+        == "None"
+    )
+
+
+def test_relatives_listed_answers_yes_and_details() -> None:
+    profile = {
+        "relatives": [
+            {
+                "name": "Pat Example",
+                "relationship": "sibling",
+                "company": "Acme",
+                "title": "Engineer",
+            }
+        ]
+    }
+    assert (
+        answer_from_profile(
+            "Do you have relatives working here?",
+            profile,
+            options=["Yes", "No"],
+        )
+        == "Yes"
+    )
+    detail = answer_from_profile(
+        "Please provide the name of any relative employed by us",
+        profile,
+    )
+    assert detail is not None
+    assert "Pat Example" in detail
+    assert "sibling" in detail
+
+
+def test_relatives_does_not_steal_family_name() -> None:
+    profile = {"last_name": "Stoddard", "relatives": []}
+    assert answer_from_profile("Family name / surname", profile) == "Stoddard"
+
+
+def test_state_not_matched_inside_state_healthcare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Regression: 'state' in 'state healthcare program' must not yield profile.state."""
+    monkeypatch.delenv("APPLY_AUTOFILL_REQUIRED", raising=False)
     path = tmp_path / "kb.json"
     profile = {
         "state": "Washington",
@@ -145,7 +217,31 @@ def test_state_not_matched_inside_state_healthcare(tmp_path: Path) -> None:
         path=path,
     )
     assert msg.startswith("RECORDED_PENDING:")
+    assert "do not stop now" in msg.lower()
+    assert "stop and report" not in msg.lower()
     assert pending_count(path) == 1
+
+
+def test_autofill_required_returns_auto_fill_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("APPLY_AUTOFILL_REQUIRED", "1")
+    assert autofill_required_enabled() is True
+    path = tmp_path / "kb.json"
+    q = (
+        "Have you ever been excluded, debarred, suspended, or otherwise found "
+        "ineligible from a federal or state healthcare program?"
+    )
+    msg = resolve_form_question(
+        question=q,
+        required=True,
+        options=["Yes", "No"],
+        profile={"state": "Washington"},
+        path=path,
+    )
+    assert msg.startswith("AUTO_FILL_OK:")
+    assert pending_count(path) == 0
+    assert len(ai_may_answer_entries(path)) == 1
 
 
 def test_profile_state_still_matches_field_phrasing() -> None:
@@ -203,7 +299,10 @@ def test_why_interested_auto_generate_ok(tmp_path: Path) -> None:
     assert pending_count(path) == 0
 
 
-def test_manual_ai_may_answer_flag(tmp_path: Path) -> None:
+def test_manual_ai_may_answer_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("APPLY_AUTOFILL_REQUIRED", raising=False)
     path = tmp_path / "kb.json"
     record_question(
         question="Describe your ideal sprint cadence for this team.",

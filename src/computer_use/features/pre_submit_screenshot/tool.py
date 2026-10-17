@@ -24,6 +24,10 @@ def build_tools(ctx: ApplyRunContext) -> list[Any]:
         to click the final Submit/Apply button (not Continue/Next). Do not call
         earlier while required fields are empty, and do not call after Submit.
 
+        The capture scrolls to the top of the page. After CAPTURED, scroll back
+        down so Submit/Apply is visible, then click it — do not reuse old bottom
+        click coordinates.
+
         Returns CAPTURED: … on success, INCOMPLETE: … if required fields remain,
         ALREADY_CAPTURED if already taken this run, or FAILED/UNAVAILABLE.
         """

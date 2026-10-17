@@ -228,3 +228,32 @@ class LandedClient:
         if not isinstance(result, dict) or not str(result.get("code") or "").strip():
             return None
         return result
+
+    def verification_link(
+        self,
+        application_id: str,
+        *,
+        since: str | None = None,
+        company: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Poll Gmail for an apply-time click-to-verify URL.
+
+        Returns ``{url, subject, from, receivedAt, messageId}`` on hit,
+        ``None`` when no matching mail yet (HTTP 204). Raises ``LandedApiError``
+        on 409 (Gmail not configured) or other failures.
+        """
+        payload: dict[str, Any] = {}
+        if since:
+            payload["since"] = since
+        if company:
+            payload["company"] = company
+        result = self._request(
+            "POST",
+            f"/api/workers/applications/{application_id}/verification-link",
+            payload=payload,
+        )
+        if result is None:
+            return None
+        if not isinstance(result, dict) or not str(result.get("url") or "").strip():
+            return None
+        return result

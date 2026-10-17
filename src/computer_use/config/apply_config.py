@@ -14,6 +14,21 @@ from .salary import enrich_profile_salary
 DEFAULT_CONFIG_PATH = Path(os.getenv("APPLY_CONFIG", "apply.config.json"))
 
 
+def normalize_always_fill_fields(raw: Any) -> list[str]:
+    """Normalize always_fill_fields to exact profile keys (deduped, order kept)."""
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        key = str(item or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
 @dataclass(frozen=True)
 class ApplyConfig:
     job_url: str
@@ -22,6 +37,7 @@ class ApplyConfig:
     notes: str | None = None
     profile: dict[str, Any] = field(default_factory=dict)
     account_signup: dict[str, Any] = field(default_factory=dict)
+    always_fill_fields: list[str] = field(default_factory=list)
 
     def validate(self) -> None:
         if not self.job_url or not self.job_url.startswith(("http://", "https://")):
@@ -100,6 +116,7 @@ def load_apply_config(path: Path | None = None) -> ApplyConfig:
         notes=raw.get("notes"),
         profile=profile,
         account_signup=account_signup,
+        always_fill_fields=normalize_always_fill_fields(raw.get("always_fill_fields")),
     )
     cfg.validate()
     return cfg
@@ -132,6 +149,7 @@ def load_apply_config_for_job(
         notes=notes if notes is not None else raw.get("notes"),
         profile=profile,
         account_signup=account_signup,
+        always_fill_fields=normalize_always_fill_fields(raw.get("always_fill_fields")),
     )
     cfg.validate()
     return cfg

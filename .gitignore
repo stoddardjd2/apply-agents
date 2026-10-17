@@ -30,4 +30,5 @@ worker.config.json
 form_knowledge.json
 form_knowledge.json.*.tmp
 apply_learnings.json
+employer_accounts.json
 *.tmp

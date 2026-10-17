@@ -1,4 +1,4 @@
-"""Email verification / OTP feature."""
+"""Email verification / OTP and click-to-verify link feature."""
 
 from __future__ import annotations
 
@@ -8,11 +8,14 @@ from .service import (
     DEFAULT_POLL_S,
     DEFAULT_TIMEOUT_S,
     check_verification_code_message,
+    check_verification_link_message,
     format_code_hit,
+    format_link_hit,
     utc_now_iso,
     wait_for_verification_code,
+    wait_for_verification_link,
 )
-from .tool import TOOL_NAME, build_tools
+from .tool import LINK_TOOL_NAME, TOOL_NAME, build_tools
 
 
 def _verification_enabled(ctx: ApplyRunContext) -> bool:
@@ -30,10 +33,14 @@ VerificationCodeFeature = define_feature(
 __all__ = [
     "DEFAULT_POLL_S",
     "DEFAULT_TIMEOUT_S",
+    "LINK_TOOL_NAME",
     "TOOL_NAME",
     "VerificationCodeFeature",
     "check_verification_code_message",
+    "check_verification_link_message",
     "format_code_hit",
+    "format_link_hit",
     "utc_now_iso",
     "wait_for_verification_code",
+    "wait_for_verification_link",
 ]

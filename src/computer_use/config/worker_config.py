@@ -53,7 +53,7 @@ class WorkerConfig:
     landed_api_base: str
     poll_interval_seconds: float = 15.0
     worker_id: str = "apply-agents"
-    blocklist: list[str] = field(default_factory=lambda: ["linkedin", "workday"])
+    blocklist: list[str] = field(default_factory=list)
     allowlist: list[str] = field(default_factory=list)
     submit: bool | None = None
     apply_config_path: Path = Path("apply.config.json")
@@ -138,6 +138,31 @@ def _matches_any(entries: list[str], adapter: str, host: str) -> bool:
     return any(_entry_matches(e, adapter, host) for e in entries)
 
 
+def _parse_csv_list(raw: str | None) -> list[str] | None:
+    """Parse comma-separated env list. None if unset; [] if set but empty."""
+    if raw is None:
+        return None
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _resolve_name_list(
+    *,
+    env_name: str,
+    raw: dict[str, Any],
+    json_key: str,
+) -> list[str]:
+    """Env wins when set; else JSON when present; else empty (block/allow nothing)."""
+    from_env = _parse_csv_list(os.getenv(env_name))
+    if from_env is not None:
+        return from_env
+    if json_key in raw:
+        value = raw.get(json_key)
+        if not isinstance(value, list):
+            return []
+        return [str(x).strip() for x in value if str(x).strip()]
+    return []
+
+
 def load_worker_config(path: Path | None = None) -> WorkerConfig:
     config_path = path or DEFAULT_WORKER_CONFIG_PATH
     raw: dict[str, Any] = {}
@@ -173,8 +198,12 @@ def load_worker_config(path: Path | None = None) -> WorkerConfig:
         landed_api_base=api_base,
         poll_interval_seconds=float(raw.get("poll_interval_seconds") or 15),
         worker_id=str(raw.get("worker_id") or "apply-agents"),
-        blocklist=[str(x).strip() for x in (raw.get("blocklist") or ["linkedin", "workday"]) if str(x).strip()],
-        allowlist=[str(x).strip() for x in (raw.get("allowlist") or []) if str(x).strip()],
+        blocklist=_resolve_name_list(
+            env_name="WORKER_BLOCKLIST", raw=raw, json_key="blocklist"
+        ),
+        allowlist=_resolve_name_list(
+            env_name="WORKER_ALLOWLIST", raw=raw, json_key="allowlist"
+        ),
         submit=submit,
         apply_config_path=apply_cfg,
         costs_path=str(raw.get("costs_path") or os.getenv("COSTS_PATH") or "costs.json"),

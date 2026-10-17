@@ -705,6 +705,11 @@ async def _run_forever_async(
                 f"stopping after {apps_done} application(s) ({reason})",
                 color=_status_style(landed_status),
             )
+            # Job already finished on Landed; stay alive only so a needs_human
+            # review window is not killed by process exit.
+            from .browser.local import hold_orphaned_browsers_until_interrupt
+
+            await hold_orphaned_browsers_until_interrupt()
             return 0
         _job_banner(
             f"JOB END  Landed status={landed_status.upper()} — idle until next claim",

@@ -2,7 +2,7 @@
   "landed_api_base": "http://localhost:8180",
   "poll_interval_seconds": 15,
   "worker_id": "apply-agents",
-  "blocklist": ["workday"],
+  "blocklist": [],
   "allowlist": [],
   "submit": null,
   "apply_config": "apply.config.json",

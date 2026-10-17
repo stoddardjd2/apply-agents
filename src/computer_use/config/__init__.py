@@ -5,6 +5,7 @@ from .apply_config import (
     DEFAULT_CONFIG_PATH,
     load_apply_config,
     load_apply_config_for_job,
+    normalize_always_fill_fields,
     with_submit,
 )
 from .salary import enrich_profile_salary, format_salary_usd, resolve_salary_expectation
@@ -24,6 +25,7 @@ __all__ = [
     "load_apply_config",
     "load_apply_config_for_job",
     "load_worker_config",
+    "normalize_always_fill_fields",
     "resolve_salary_expectation",
     "with_submit",
 ]

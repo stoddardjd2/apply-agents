@@ -145,6 +145,53 @@ def form_knowledge_path(path: Path | str | None = None) -> Path:
     return Path(env) if env else DEFAULT_KB_PATH
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def autofill_required_enabled() -> bool:
+    """APPLY_AUTOFILL_REQUIRED — fill every required field without asking the user."""
+    return _env_bool("APPLY_AUTOFILL_REQUIRED", False)
+
+
+def _pending_continue_guidance(*, required: bool) -> str:
+    """Instruct the agent to keep collecting gaps until final Submit."""
+    if not required:
+        return "Optional — leave blank / skip if appropriate."
+    return (
+        "Required — do not stop now. Leave blank if the UI allows; otherwise "
+        "fill a temporary hire-safe value so Continue/Next works (KB answer "
+        "stays null for the user). Keep resolving other required unknowns. "
+        "Only when the final Submit/Apply button is visible: do not click it "
+        "and do not engage captcha if any required pending remains; then "
+        "report **Application submitted:** No with one **Blocked:** listing "
+        "all pending ids/questions from this run."
+    )
+
+
+def _autofill_ok_message(entry: dict[str, Any] | None = None) -> str:
+    opts = None
+    if entry is not None:
+        raw = entry.get("options")
+        if isinstance(raw, list) and raw:
+            opts = [str(o) for o in raw if str(o).strip()]
+    extra = f" Prefer one of: {', '.join(opts)}." if opts else ""
+    return (
+        "AUTO_FILL_OK: Autofill mode is on — answer this required question yourself "
+        "now using PROFILE + best judgment. Never stop, ask the user, clarify, or "
+        "write Blocked/needs-human. Choose the option that does not hurt hire "
+        "chances while staying consistent with PROFILE (e.g. No on exclusions/"
+        "discipline/criminal when PROFILE has no contrary fact; Yes on willingness/"
+        "relocation/auth when PROFILE supports it; truthful work-auth from PROFILE). "
+        "Do not invent clearance, SSN, medical diagnoses, or sponsorship needs "
+        "absent from PROFILE."
+        + extra
+    )
+
+
 def normalize_question(text: str) -> str:
     s = (text or "").lower().strip()
     s = re.sub(r"[^\w\s]", " ", s)
@@ -181,6 +228,125 @@ def _format_answer(value: Any, *, profile_key: str | None = None) -> str:
         except (TypeError, ValueError):
             pass
     return str(value).strip()
+
+
+# Relatives / family-at-company (not "family name" = surname).
+_RELATIVE_Q_RE = re.compile(
+    r"\b("
+    r"relative|relatives|family member|family members|"
+    r"related to anyone|know anyone (who |that )?(works|employed|working)|"
+    r"anyone.*(employ|works at|working at)|"
+    r"immediate family|close (personal )?relationship|"
+    r"spouse.*(work|employ)|family relationship|"
+    r"friend or relative|friends or relatives"
+    r")\b",
+    re.I,
+)
+_FAMILY_NAME_RE = re.compile(r"\b(family name|surname|last name)\b", re.I)
+
+
+def is_relatives_question(question: str) -> bool:
+    """True for employer relative / family-relationship screens (not surname fields)."""
+    q = (question or "").strip()
+    if not q or _FAMILY_NAME_RE.search(q):
+        return False
+    return bool(_RELATIVE_Q_RE.search(q))
+
+
+def relatives_entries(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Normalized list from profile.relatives; missing/empty → no relatives."""
+    if not profile:
+        return []
+    raw = profile.get("relatives")
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        out: list[dict[str, Any]] = []
+        for item in raw:
+            if isinstance(item, dict):
+                out.append(item)
+            elif str(item or "").strip():
+                out.append({"name": str(item).strip()})
+        return out
+    if isinstance(raw, dict):
+        # Allow {"none": true} or a single entry object.
+        if raw.get("none") is True or raw.get("has_relatives") is False:
+            return []
+        entries = raw.get("entries")
+        if isinstance(entries, list):
+            return [e for e in entries if isinstance(e, dict)]
+        if any(raw.get(k) for k in ("name", "relationship", "company", "title")):
+            return [raw]
+    return []
+
+
+def format_relatives_answer(
+    question: str,
+    profile: dict[str, Any] | None,
+    options: list[str] | None = None,
+) -> str | None:
+    """Answer a relatives question from profile.relatives (empty ⇒ No / None)."""
+    if not is_relatives_question(question):
+        return None
+    entries = relatives_entries(profile)
+    opts = [str(o).strip() for o in (options or []) if str(o).strip()]
+    key = normalize_question(question)
+    wants_details = bool(
+        re.search(
+            r"\b(list|name|names|who|provide|identify|describe|enter|specify|"
+            r"details|relationship|which relative)\b",
+            key,
+        )
+    )
+    wants_yes_no = bool(opts) and all(
+        (
+            normalize_question(o) in {"yes", "no", "y", "n", "true", "false"}
+            or normalize_question(o).startswith("yes ")
+            or normalize_question(o).startswith("no ")
+        )
+        for o in opts
+    )
+    # Unlabeled boolean screens: "Do you have relatives…?" — not "List any…".
+    if not opts and not wants_details and re.search(
+        r"\b(do you|have you|are you|is there)\b", key
+    ):
+        wants_yes_no = True
+
+    if not entries:
+        if wants_yes_no or (opts and any(normalize_question(o) == "no" for o in opts)):
+            candidate = "No"
+        elif opts:
+            for prefer in ("none", "n a", "na", "not applicable", "no"):
+                for o in opts:
+                    if normalize_question(o) == prefer or prefer in normalize_question(o):
+                        return o
+            return None
+        else:
+            candidate = "None"
+        if _answer_fits_options(candidate, options):
+            return candidate
+        return candidate if not opts else None
+
+    # Has relatives listed.
+    if wants_yes_no and not wants_details:
+        candidate = "Yes"
+        if _answer_fits_options(candidate, options):
+            return candidate
+        return candidate if not opts else None
+
+    parts: list[str] = []
+    for e in entries:
+        bits = [
+            str(e.get(k) or "").strip()
+            for k in ("name", "relationship", "company", "title")
+            if str(e.get(k) or "").strip()
+        ]
+        if bits:
+            parts.append(", ".join(bits))
+    text = "; ".join(parts) if parts else "Yes"
+    if _answer_fits_options(text, options):
+        return text
+    return text if not opts else None
 
 
 def load_kb(path: Path | str | None = None) -> dict[str, Any]:
@@ -234,6 +400,8 @@ def is_ai_generatable_question(
 
 def _ai_may_answer(entry: dict[str, Any]) -> bool:
     """True when the entry flag is set or the question matches soft-essay heuristics."""
+    if autofill_required_enabled() and bool(entry.get("required", True)):
+        return True
     if bool(entry.get("ai_may_answer")):
         return True
     opts = entry.get("options")
@@ -361,6 +529,11 @@ def answer_from_profile(
     options: list[str] | None = None,
 ) -> str | None:
     """Best-effort answer from profile / custom_answers without writing to the KB."""
+    # Relatives: empty/missing profile.relatives ⇒ No / None (even if profile is {}).
+    relatives_hit = format_relatives_answer(question, profile, options)
+    if relatives_hit is not None:
+        return relatives_hit
+
     if not profile:
         return None
     key = normalize_question(question)
@@ -391,7 +564,9 @@ def answer_from_profile(
 
     # Exact / near-exact top-level keys mentioned in the question
     for pk, pv in profile.items():
-        if pk == "custom_answers" or str(pk).startswith("_") or isinstance(pv, (dict, list)):
+        if pk in {"custom_answers", "relatives", "eeo"} or str(pk).startswith("_"):
+            continue
+        if isinstance(pv, (dict, list)):
             continue
         pk_norm = normalize_question(str(pk).replace("_", " "))
         if pk_norm and _profile_key_matches_question(pk_norm, key):
@@ -446,6 +621,8 @@ def record_question(
             existing_idx = i
             break
 
+    autofill = autofill_required_enabled() and bool(required)
+
     if existing is not None and existing_idx is not None:
         entry = dict(existing)
         entry["question"] = q
@@ -462,9 +639,13 @@ def record_question(
             entry["field_label"] = str(field_label).strip()
         if job_url and str(job_url).strip():
             entry["job_url"] = str(job_url).strip()
-        # Soft-essay heuristics (or an existing true flag) mark AI-writable.
-        entry["ai_may_answer"] = bool(entry.get("ai_may_answer")) or is_ai_generatable_question(
-            q, opts if opts is not None else entry.get("options")
+        # Soft-essay heuristics, existing flag, or autofill mode mark AI-writable.
+        entry["ai_may_answer"] = (
+            autofill
+            or bool(entry.get("ai_may_answer"))
+            or is_ai_generatable_question(
+                q, opts if opts is not None else entry.get("options")
+            )
         )
         entry["updated_at"] = now
         entries[existing_idx] = entry
@@ -476,6 +657,13 @@ def record_question(
                 "id": entry.get("id"),
                 "answer": _format_answer(entry.get("answer")),
                 "message": f"ANSWER: {_format_answer(entry.get('answer'))}",
+            }
+        if autofill:
+            return {
+                "status": "autofill_ok",
+                "id": entry.get("id"),
+                "answer": None,
+                "message": _autofill_ok_message(entry),
             }
         if _ai_may_answer(entry):
             return {
@@ -491,7 +679,8 @@ def record_question(
             "message": (
                 f"RECORDED_PENDING: already tracked as id={entry.get('id')}. "
                 f"Fill form_knowledge.json answer for id={entry.get('id')}, "
-                f"or set ai_may_answer=true to let the agent write it."
+                f"or set ai_may_answer=true to let the agent write it. "
+                + _pending_continue_guidance(required=bool(entry.get("required")))
             ),
         }
 
@@ -501,7 +690,7 @@ def record_question(
     if entry_id in used:
         entry_id = f"{entry_id}_{uuid.uuid4().hex[:6]}"
 
-    ai_ok = is_ai_generatable_question(q, opts)
+    ai_ok = autofill or is_ai_generatable_question(q, opts)
     entry = {
         "id": entry_id,
         "question": q,
@@ -524,6 +713,13 @@ def record_question(
     entries.append(entry)
     kb["entries"] = entries
     save_kb(kb, path)
+    if autofill:
+        return {
+            "status": "autofill_ok",
+            "id": entry_id,
+            "answer": None,
+            "message": _autofill_ok_message(entry),
+        }
     if ai_ok:
         return {
             "status": "generate_ok",
@@ -538,9 +734,8 @@ def record_question(
         "message": (
             f"RECORDED_PENDING: saved id={entry_id}. "
             f"Fill form_knowledge.json answer for id={entry_id}, "
-            f"or set ai_may_answer=true to let the agent write it."
-            + (" Required — stop and report if you cannot proceed." if required else
-               " Optional — leave blank / skip if appropriate.")
+            f"or set ai_may_answer=true to let the agent write it. "
+            + _pending_continue_guidance(required=bool(required))
         ),
     }
 
@@ -570,10 +765,12 @@ def resolve_form_question(
         )
 
     existing = lookup_entry(question, path)
-    if existing is not None and _ai_may_answer(existing):
-        # Persist soft-essay auto-flag so the prompt lists it under AI may generate.
-        if not bool(existing.get("ai_may_answer")) and is_ai_generatable_question(
-            question, options if options is not None else existing.get("options")
+    if existing is not None and (
+        _ai_may_answer(existing) or (autofill_required_enabled() and required)
+    ):
+        # Persist soft-essay / autofill flag so the prompt lists it under AI may generate.
+        if not bool(existing.get("ai_may_answer")) or (
+            autofill_required_enabled() and required and not bool(existing.get("ai_may_answer"))
         ):
             record_question(
                 question=question,
@@ -585,6 +782,10 @@ def resolve_form_question(
                 job_url=job_url,
                 path=path,
             )
+        if autofill_required_enabled() and (
+            required or bool(existing.get("required"))
+        ):
+            return _autofill_ok_message(existing)
         return _generate_ok_message(existing)
 
     # Soft free-text (mission/values / why interested): generate — do not pending.

@@ -3,21 +3,36 @@
 from __future__ import annotations
 
 from ..base import ApplyRunContext
+from .service import find_accounts_for_site, format_accounts_for_prompt
 
 SYSTEM_INSTRUCTIONS = """
 - Account creation: only on the employer's own career/ATS site, and only when
   ACCOUNT SIGNUP rules in the task allow it. Prefer Google SSO over
   email/password. Never invent a password.
+- When SAVed EMPLOYER ACCOUNTS are listed for this site, Sign In with those
+  credentials — do not Create Account again. If verification=needs_verification,
+  open the emailed verify link first (open_verification_link when available).
+- After Create Account (or after email verify succeeds), call
+  record_employer_account so credentials can be reused on later visits.
 """.strip()
 
 
 def user_prompt_block(ctx: ApplyRunContext) -> str:
     cfg = ctx.account_signup or {}
+    saved = find_accounts_for_site(
+        site_url=ctx.job_url,
+        company=ctx.company,
+    )
+    saved_block = format_accounts_for_prompt(saved)
+
     if not cfg.get("enabled"):
-        return (
+        parts = [
             "ACCOUNT SIGNUP: disabled. Do not create new employer accounts. "
             "Sign in only if already logged in or via Google SSO when available."
-        )
+        ]
+        if saved_block:
+            parts.append(saved_block)
+        return "\n".join(parts)
 
     email = str(cfg.get("email") or "").strip()
     password = str(cfg.get("password") or "").strip()
@@ -29,20 +44,26 @@ def user_prompt_block(ctx: ApplyRunContext) -> str:
     majors_text = ", ".join(majors) if majors else "(none listed)"
 
     if not allow_create:
-        return (
+        parts = [
             "ACCOUNT SIGNUP: do not create accounts. Prefer Google SSO if offered; "
             "otherwise stop and report that sign-in is required."
-        )
+        ]
+        if saved_block:
+            parts.append(saved_block)
+        return "\n".join(parts)
 
     if not email or not password:
-        return (
+        parts = [
             "ACCOUNT SIGNUP: create-on-non-major is enabled, but email/password are "
             "missing. Set account_signup.email / account_signup.password in "
             "apply.config.json, or APPLY_ACCOUNT_EMAIL / APPLY_ACCOUNT_PASSWORD in "
             ".env. Prefer Google SSO if offered; otherwise stop and report that "
             "signup credentials are missing.\n"
             f"Treat these as major employers (do not create accounts): {majors_text}."
-        )
+        ]
+        if saved_block:
+            parts.append(saved_block)
+        return "\n".join(parts)
 
     sso = (
         "Prefer Continue with Google / Google SSO whenever it is offered. "
@@ -60,7 +81,8 @@ def user_prompt_block(ctx: ApplyRunContext) -> str:
         "ziprecruiter.com",
     ]
     never_text = ", ".join(never_hosts)
-    return (
+
+    parts = [
         "ACCOUNT SIGNUP RULES:\n"
         f"- NEVER create accounts on these job boards/hosts: {never_text}. "
         "Do not fill Join/Sign up on those sites. Click Apply / continue until you "
@@ -79,5 +101,18 @@ def user_prompt_block(ctx: ApplyRunContext) -> str:
         "- If Create Account fails (error, email already used, verify email), try "
         "Sign In with the same email/password. If that also fails, stop and report "
         "the exact on-screen error.\n"
+        "- After Create Account (or successful Sign In on a new host), call "
+        "record_employer_account with site_url=the employer career URL, "
+        "verification_status=needs_verification if the site requires emailed "
+        "verify, or verified if Sign In works. After open_verification_link "
+        "succeeds, call record_employer_account again with verification_status="
+        "verified.\n"
         "- Report whether an employer account was created (never a job-board account)."
-    )
+    ]
+    if saved_block:
+        parts.append(saved_block)
+        parts.append(
+            "If a SAVED EMPLOYER ACCOUNT matches this career host, Sign In with "
+            "those credentials instead of Create Account."
+        )
+    return "\n".join(parts)

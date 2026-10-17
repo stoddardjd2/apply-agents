@@ -36,8 +36,10 @@ def build_tools(ctx: ApplyRunContext) -> list[Any]:
         required defaults to true (this tool is for required unknowns). Pass
         required=false only for clearly optional fields (returns SKIP_OPTIONAL
         and does not write the KB). Returns ANSWER: … when known, GENERATE_OK: …
-        for soft essays / ai_may_answer, or RECORDED_PENDING: … for factual
-        unknowns the user must answer.
+        / AUTO_FILL_OK: … when you should answer yourself (APPLY_AUTOFILL_REQUIRED
+        or soft essays), or RECORDED_PENDING: … when autofill is off and the user
+        must answer later — that means saved for offline fill; continue the form
+        and keep collecting other unknowns (do not abort mid-form).
         """
         return resolve_form_question(
             question=question,
